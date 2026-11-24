@@ -1,0 +1,553 @@
+name: Test Day-0 Bootstrap Script
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'bootstrap-1st-install.sh'
+      - '.github/workflows/test-bootstrap.yml'
+  pull_request:
+    paths:
+      - 'bootstrap-1st-install.sh'
+      - '.github/workflows/test-bootstrap.yml'
+  workflow_dispatch:
+
+env:
+  # Sesuaikan jika nama/lokasi skrip di repo berbeda (mis. "./scripts/bootstrap-1st-install.sh")
+  SCRIPT_PATH: ./bootstrap-1st-install.sh
+
+jobs:
+  # ===========================================================================
+  # 1. Static Analysis & CLI Argument Parsing
+  # ===========================================================================
+  lint-and-cli:
+    name: 1. Lint & CLI Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check bash syntax & ShellCheck
+        run: |
+          chmod +x "$SCRIPT_PATH"
+          bash -n "$SCRIPT_PATH"
+          shellcheck -S warning "$SCRIPT_PATH"
+
+      - name: Test CLI flags (--help, conflicts, unknown options)
+        run: |
+          set -euo pipefail
+
+          # --help harus sukses dan mencetak dokumentasi header
+          "$SCRIPT_PATH" --help | grep -q "MODE 1: --managed"
+          "$SCRIPT_PATH" -h | grep -q "MODE 2: --control"
+
+          # Tanpa argumen harus exit non-zero
+          if "$SCRIPT_PATH" >/dev/null 2>&1; then
+            echo "FAIL: tanpa argumen seharusnya gagal" >&2; exit 1
+          fi
+
+          # Konflik --managed dan --control harus ditolak
+          if "$SCRIPT_PATH" --managed --control >/dev/null 2>&1; then
+            echo "FAIL: kombinasi --managed --control seharusnya ditolak" >&2; exit 1
+          fi
+
+          # Opsi tak dikenal harus ditolak
+          if "$SCRIPT_PATH" --managed --opsi-ngawur >/dev/null 2>&1; then
+            echo "FAIL: opsi tak dikenal seharusnya ditolak" >&2; exit 1
+          fi
+
+          echo "CLI checks PASSED"
+
+  # ===========================================================================
+  # 2. Unit Test Fungsi Validasi, Topologi, Inventory & Patching YAML
+  # ===========================================================================
+  unit-tests:
+    name: 2. Unit Tests (Validators, Quorum, YAML Patch)
+    runs-on: ubuntu-latest
+    needs: lint-and-cli
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PyYAML for output validation
+        run: python3 -c "import yaml" 2>/dev/null || pip install --quiet pyyaml
+
+      - name: Run unit test suite against sourced functions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # Source skrip tanpa menjalankan main() berkat BASH_SOURCE guard
+          # shellcheck disable=SC1090
+          source "$SCRIPT_PATH"
+          trap - ERR
+
+          assert_ok() {
+            local desc=$1; shift
+            if ! ( "$@" ) >/dev/null 2>&1; then
+              echo "FAIL (expected OK): $desc" >&2
+              exit 1
+            fi
+            echo "PASS: $desc"
+          }
+
+          assert_fail() {
+            local desc=$1; shift
+            if ( "$@" ) >/dev/null 2>&1; then
+              echo "FAIL (expected FAIL): $desc" >&2
+              exit 1
+            fi
+            echo "PASS (rejected): $desc"
+          }
+
+          # --- A. Helper validators ---
+          assert_ok   "is_ipv4 valid"           is_ipv4 "10.88.0.1"
+          assert_fail "is_ipv4 octet > 255"     is_ipv4 "10.88.0.256"
+          assert_fail "is_ipv4 non-ip"          is_ipv4 "not.an.ip.addr"
+          assert_ok   "is_port valid"           is_port "5432"
+          assert_fail "is_port zero"            is_port "0"
+          assert_fail "is_port > 65535"         is_port "70000"
+          assert_ok   "is_name valid"           is_name "db_node-1"
+          assert_fail "is_name uppercase"       is_name "DB1"
+          assert_ok   "is_pg_ident valid"       is_pg_ident "odoo_store1"
+          assert_fail "is_pg_ident hyphen"      is_pg_ident "odoo-store1"
+          assert_ok   "is_placeholder_ip RFC5737" is_placeholder_ip "203.0.113.10"
+          assert_fail "is_placeholder_ip RFC1918" is_placeholder_ip "172.28.0.10"
+          assert_ok   "is_hostname FQDN"        is_hostname "node-db1.internal.local"
+          assert_fail "is_hostname leading dash" is_hostname "-badhost"
+          assert_ok   "version_ge 2.16 >= 2.15" version_ge "2.16.4" "2.15"
+          assert_fail "version_ge 2.14 < 2.15"  version_ge "2.14.9" "2.15"
+
+          # --- B. Validasi topologi & kuorum Raft ---
+          export OVPN_PUBLIC_ENDPOINT="vpn.prod.example.internal"
+          export BACKUP_SSH_IP="172.28.0.10" BACKUP_VPN_IP="10.88.0.1"
+          export MON_SSH_IP="172.28.0.20"    MON_VPN_IP="10.88.0.20"
+          export DB_HOSTS="1:db1:172.28.0.11:10.88.0.11:manager:100:yes,2:db2:172.28.0.12:10.88.0.12:manager:90:yes,3:db3:172.28.0.13:10.88.0.13:worker:0:no"
+          export STORE_LIST_SPEC="STR01:store1:monitoring:8069:odoo_store1,STR02:store2:monitoring:8070:odoo_store2:custom_usr"
+
+          assert_ok "parse_cluster_specs valid 3 managers" parse_cluster_specs
+          assert_ok "validate_control_config valid"        validate_control_config
+          assert_ok "check_placeholders clean RFC1918"     bash -c 'source "$SCRIPT_PATH"; trap - ERR; parse_cluster_specs; check_placeholders'
+
+          # Kuorum genap (backup + db1 = 2 manager) harus gagal tanpa ALLOW_BAD_QUORUM=1
+          assert_fail "quorum even rejected" env \
+            DB_HOSTS="1:db1:172.28.0.11:10.88.0.11:manager:100:yes,2:db2:172.28.0.12:10.88.0.12:worker:90:yes" \
+            ALLOW_BAD_QUORUM=0 \
+            bash -c 'source "$SCRIPT_PATH"; trap - ERR; parse_cluster_specs'
+
+          assert_ok "quorum even allowed with ALLOW_BAD_QUORUM=1" env \
+            DB_HOSTS="1:db1:172.28.0.11:10.88.0.11:manager:100:yes,2:db2:172.28.0.12:10.88.0.12:worker:90:yes" \
+            ALLOW_BAD_QUORUM=1 \
+            bash -c 'source "$SCRIPT_PATH"; trap - ERR; parse_cluster_specs'
+
+          # Kasus error DB_HOSTS & STORE_LIST_SPEC
+          assert_fail "DB_HOSTS < 2 node" env \
+            DB_HOSTS="1:db1:172.28.0.11:10.88.0.11:manager:100:yes" \
+            bash -c 'source "$SCRIPT_PATH"; trap - ERR; parse_cluster_specs'
+
+          assert_fail "DB_HOSTS duplicate VPN IP" env \
+            DB_HOSTS="1:db1:172.28.0.11:10.88.0.11:manager:100:yes,2:db2:172.28.0.12:10.88.0.11:manager:90:yes" \
+            bash -c 'source "$SCRIPT_PATH"; trap - ERR; parse_cluster_specs'
+
+          assert_fail "DB_HOSTS reserved name backup" env \
+            DB_HOSTS="1:backup:172.28.0.11:10.88.0.11:manager:100:yes,2:db2:172.28.0.12:10.88.0.12:manager:90:yes" \
+            bash -c 'source "$SCRIPT_PATH"; trap - ERR; parse_cluster_specs'
+
+          assert_fail "STORE_LIST_SPEC host:port collision" env \
+            STORE_LIST_SPEC="STR01:store1:monitoring:8069:odoo_store1,STR02:store2:monitoring:8069:odoo_store2" \
+            bash -c 'source "$SCRIPT_PATH"; trap - ERR; parse_cluster_specs'
+
+          # STORE_LIST_SPEC="" menonaktifkan Pola 1 (0 store)
+          STORE_COUNT=$(STORE_LIST_SPEC="" bash -c 'source "$SCRIPT_PATH"; trap - ERR; parse_cluster_specs; echo "${#STORE_NAMES[@]}"')
+          [[ "$STORE_COUNT" == "0" ]] || { echo "FAIL: STORE_LIST_SPEC kosong seharusnya 0 store, dapat $STORE_COUNT" >&2; exit 1; }
+          echo "PASS: STORE_LIST_SPEC='' disables Pola 1"
+
+          # --- C. Placeholder guard ---
+          assert_fail "placeholder TEST-NET rejected" env \
+            BACKUP_SSH_IP="203.0.113.10" ALLOW_PLACEHOLDER=0 DRY_RUN=0 \
+            bash -c 'source "$SCRIPT_PATH"; trap - ERR; parse_cluster_specs; check_placeholders'
+
+          assert_ok "placeholder allowed with ALLOW_PLACEHOLDER=1" env \
+            BACKUP_SSH_IP="203.0.113.10" ALLOW_PLACEHOLDER=1 DRY_RUN=0 \
+            bash -c 'source "$SCRIPT_PATH"; trap - ERR; parse_cluster_specs; check_placeholders'
+
+          # --- D. Config control validation ---
+          assert_fail "relative SSH_KEY_PATH rejected" env SSH_KEY_PATH="relative/id_ed25519" \
+            bash -c 'source "$SCRIPT_PATH"; trap - ERR; validate_control_config'
+
+          assert_fail "invalid OVPN_PROTO rejected" env OVPN_PROTO="icmp" \
+            bash -c 'source "$SCRIPT_PATH"; trap - ERR; validate_control_config'
+
+          assert_fail "same BACKUP_VPN_IP and MON_VPN_IP" env BACKUP_VPN_IP="10.88.0.1" MON_VPN_IP="10.88.0.1" \
+            bash -c 'source "$SCRIPT_PATH"; trap - ERR; validate_control_config'
+
+          # --- E. emit_inventory & patch_group_vars (YAML valid + idempotensi) ---
+          TMP_TEST=$(mktemp -d)
+          trap 'rm -rf "$TMP_TEST"' EXIT
+
+          # Uji non-root SSH_USER memunculkan ansible_become: true
+          SSH_USER="ubuntu" parse_cluster_specs
+          SSH_USER="ubuntu" emit_inventory > "$TMP_TEST/hosts.yml"
+          python3 - "$TMP_TEST/hosts.yml" <<'PY'
+          import sys, yaml
+          data = yaml.safe_load(open(sys.argv[1]))
+          assert data["all"]["vars"]["ansible_user"] == "ubuntu"
+          assert data["all"]["vars"]["ansible_become"] is True
+          dbs = data["all"]["children"]["db_nodes"]["hosts"]
+          assert dbs["db1"]["is_primary"] is True
+          assert dbs["db2"]["is_primary"] is False
+          assert dbs["db3"]["sync_eligible"] is False
+          print("PASS: emit_inventory YAML valid & attributes exact")
+          PY
+
+          # Uji patch_group_vars + komentar dipertahankan + idempotensi 2x run
+          mkdir -p "$TMP_TEST/bak"
+          cat > "$TMP_TEST/all.yml" <<'YAML'
+          ---
+          ovpn_public_endpoint: "old.invalid"
+          ovpn_port: 1194
+          ovpn_proto: "udp"
+          store_nodes:
+            - code: "OLD"
+              name: "legacy"
+
+          # Komentar penting sebelum variabel lain
+          keep_this_key: "intact"
+          YAML
+
+          OVPN_PUBLIC_ENDPOINT="vpn.prod.example.internal" OVPN_PORT="51820" OVPN_PROTO="tcp" \
+            patch_group_vars "$TMP_TEST/all.yml" "$TMP_TEST/bak"
+          cp "$TMP_TEST/all.yml" "$TMP_TEST/all.run1.yml"
+
+          # Jalankan kedua kali untuk uji idempotensi
+          OVPN_PUBLIC_ENDPOINT="vpn.prod.example.internal" OVPN_PORT="51820" OVPN_PROTO="tcp" \
+            patch_group_vars "$TMP_TEST/all.yml" "$TMP_TEST/bak"
+
+          diff -u "$TMP_TEST/all.run1.yml" "$TMP_TEST/all.yml"
+          [[ -f "$TMP_TEST/bak/all.yml.orig" ]]
+          grep -q "# Komentar penting sebelum variabel lain" "$TMP_TEST/all.yml"
+
+          python3 - "$TMP_TEST/all.yml" <<'PY'
+          import sys, yaml
+          data = yaml.safe_load(open(sys.argv[1]))
+          assert data["ovpn_public_endpoint"] == "vpn.prod.example.internal"
+          assert data["ovpn_port"] == 51820
+          assert data["ovpn_proto"] == "tcp"
+          assert data["keep_this_key"] == "intact"
+          assert len(data["store_nodes"]) == 2
+          assert data["store_nodes"][0]["db_user"] == "odoo_store1"
+          assert data["store_nodes"][1]["db_user"] == "custom_usr"
+          print("PASS: patch_group_vars YAML valid, idempotent, & preserves comments")
+          PY
+
+  # ===========================================================================
+  # 3. Dry-Run Smoke Test (Non-Root)
+  # ===========================================================================
+  dry-run:
+    name: 3. Dry-Run Mode (Managed & Control)
+    runs-on: ubuntu-latest
+    needs: lint-and-cli
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run --managed --dry-run and --control --dry-run as non-root
+        run: |
+          set -euo pipefail
+          chmod +x "$SCRIPT_PATH"
+
+          ssh-keygen -q -t ed25519 -N "" -f /tmp/dryrun_key
+
+          # Mode --managed --dry-run
+          "$SCRIPT_PATH" --managed --dry-run \
+            --hostname node-db1 \
+            --pubkey-file /tmp/dryrun_key.pub 2>&1 | tee /tmp/managed-dry.log
+          grep -q "\[DRY-RUN\]" /tmp/managed-dry.log
+
+          # Mode --control --dry-run --auto-deploy (dengan placeholder default -> warning, bukan error)
+          "$SCRIPT_PATH" --control --dry-run --auto-deploy 2>&1 | tee /tmp/control-dry.log
+          grep -q "ansible-playbook -i inventory/hosts.yml site.yml" /tmp/control-dry.log
+
+  # ===========================================================================
+  # 4. Integration Test: Mode 1 (--managed) di Debian & Ubuntu
+  # ===========================================================================
+  integration-managed:
+    name: 4. Integration --managed (${{ matrix.os }})
+    runs-on: ubuntu-latest
+    needs: [unit-tests, dry-run]
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - debian:12
+          - ubuntu:22.04
+          - ubuntu:24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare test SSH keypair
+        run: ssh-keygen -q -t ed25519 -N "" -C "ci-control@test" -f /tmp/ci_control_ed25519
+
+      - name: Test A — Full --managed (hostname, pubkey, sshd hardening, idempotency)
+        run: |
+          set -euo pipefail
+          chmod +x "$SCRIPT_PATH"
+
+          docker run --rm --cap-add=SYS_ADMIN \
+            -v "$PWD/$SCRIPT_PATH:/bootstrap.sh:ro" \
+            -v "/tmp/ci_control_ed25519.pub:/control.pub:ro" \
+            "${{ matrix.os }}" bash -Eeuo pipefail -s <<'EOF'
+          # Eksekusi pertama
+          /bootstrap.sh --managed --hostname node-db1.test.local --pubkey-file /control.pub
+
+          # 1. Verifikasi paket prasyarat Ansible Managed Node
+          for pkg in openssh-server openssh-client python3 python3-apt sudo acl curl ca-certificates gnupg; do
+            dpkg -s "$pkg" >/dev/null 2>&1 || { echo "Package missing: $pkg" >&2; exit 1; }
+          done
+
+          # 2. Verifikasi hostname & /etc/hosts
+          [[ "$(hostname)" == "node-db1.test.local" ]]
+          grep -qE '^127\.0\.1\.1[[:space:]]+node-db1\.test\.local node-db1$' /etc/hosts
+
+          # 3. Verifikasi authorized_keys & permission
+          [[ "$(stat -c '%a' /root/.ssh)" == "700" ]]
+          [[ "$(stat -c '%a' /root/.ssh/authorized_keys)" == "600" ]]
+          [[ "$(wc -l < /root/.ssh/authorized_keys)" -eq 1 ]]
+
+          # 4. Verifikasi drop-in sshd & efektifitas sshd -T
+          grep -qxF "PubkeyAuthentication yes" /etc/ssh/sshd_config.d/00-ansible-bootstrap.conf
+          grep -qxF "PermitRootLogin prohibit-password" /etc/ssh/sshd_config.d/00-ansible-bootstrap.conf
+          /usr/sbin/sshd -t
+          /usr/sbin/sshd -T | grep -qi '^pubkeyauthentication yes$'
+          /usr/sbin/sshd -T | grep -qi '^permitrootlogin prohibit-password$'
+
+          # 5. Uji idempotensi (eksekusi kedua tidak menduplikasi authorized_keys)
+          /bootstrap.sh --managed --hostname node-db1.test.local --pubkey-file /control.pub
+          [[ "$(wc -l < /root/.ssh/authorized_keys)" -eq 1 ]]
+
+          # 6. Uji penolakan pubkey cacat
+          if /bootstrap.sh --managed --pubkey-string "ssh-ed25519 INVALID_KEY_PAYLOAD" >/dev/null 2>&1; then
+            echo "FAIL: pubkey invalid seharusnya ditolak" >&2; exit 1
+          fi
+
+          echo "Test A PASSED on $(. /etc/os-release && echo "$PRETTY_NAME")"
+          EOF
+
+      - name: Test B — Anti-Lockout (no pubkey) & Legacy sshd_config Include injection
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD/$SCRIPT_PATH:/bootstrap.sh:ro" \
+            "${{ matrix.os }}" bash -Eeuo pipefail -s <<'EOF'
+          # Pasang openssh-server duluan lalu hapus baris Include untuk mensimulasikan distro lama (Ubuntu 20.04)
+          DEBIAN_FRONTEND=noninteractive apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends openssh-server
+          sed -i '/Include \/etc\/ssh\/sshd_config\.d/d' /etc/ssh/sshd_config
+
+          # Jalankan --managed TANPA pubkey
+          /bootstrap.sh --managed
+
+          # Pastikan PermitRootLogin TIDAK dipaksa prohibit-password (anti-lockout)
+          grep -qxF "PubkeyAuthentication yes" /etc/ssh/sshd_config.d/00-ansible-bootstrap.conf
+          if grep -q "PermitRootLogin" /etc/ssh/sshd_config.d/00-ansible-bootstrap.conf; then
+            echo "FAIL: PermitRootLogin seharusnya tidak ditulis saat tanpa pubkey" >&2; exit 1
+          fi
+
+          # Pastikan Include ditambahkan di baris pertama & backup dibuat
+          head -n1 /etc/ssh/sshd_config | grep -q "Include /etc/ssh/sshd_config.d/\*.conf"
+          [[ -f /etc/ssh/sshd_config.bak-bootstrap ]]
+          /usr/sbin/sshd -t
+
+          echo "Test B PASSED"
+          EOF
+
+  # ===========================================================================
+  # 5. End-to-End Multi-Container Test: Mode 2 (--control) + 5 Target Nodes
+  # ===========================================================================
+  e2e-control-cluster:
+    name: 5. E2E Cluster (--control -> 5 Nodes -> Ansible Ping & Auto-Deploy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [unit-tests, integration-managed]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build mock Ansible project zip & minimal target node image
+        run: |
+          set -euo pipefail
+          chmod +x "$SCRIPT_PATH"
+
+          # 1. Buat arsip ZIP mock dengan struktur folder bersarang & permission 777
+          #    untuk menguji auto-unwrap folder + chmod go-w pada WORK_DIR
+          mkdir -p /tmp/mock-zip/ansible-pg-dbaas-swarm-v3/inventory/group_vars
+          cat > /tmp/mock-zip/ansible-pg-dbaas-swarm-v3/ansible.cfg <<'CFG'
+          [defaults]
+          host_key_checking = False
+          stdout_callback = default
+          CFG
+
+          cat > /tmp/mock-zip/ansible-pg-dbaas-swarm-v3/inventory/group_vars/all.yml <<'YAML'
+          ---
+          ovpn_public_endpoint: "vpn.domain-lo.com"
+          ovpn_port: 1194
+          ovpn_proto: "udp"
+          store_nodes:
+            - code: "OLD01"
+              name: "oldstore"
+              swarm_host: "monitoring"
+              http_port: 8069
+              db_name: "odoo_old"
+
+          # Marker untuk memastikan komentar tidak terhapus saat patch_group_vars
+          baseline_flag: "kept"
+          YAML
+
+          cat > /tmp/mock-zip/ansible-pg-dbaas-swarm-v3/site.yml <<'YAML'
+          ---
+          - name: Verify Day-0 Bootstrapped Inventory & Variables
+            hosts: all
+            gather_facts: true
+            tasks:
+              - name: Verify global OpenVPN & Pola 1 store_nodes variables
+                ansible.builtin.assert:
+                  that:
+                    - ovpn_public_endpoint == "vpn.e2e.internal"
+                    - ovpn_port | int == 1195
+                    - ovpn_proto == "udp"
+                    - baseline_flag == "kept"
+                    - store_nodes | length == 3
+                    - store_nodes[0].code == "STR01"
+                    - store_nodes[2].http_port | int == 8071
+
+              - name: Verify primary DB flag only on db1
+                when: "'db_nodes' in group_names"
+                ansible.builtin.assert:
+                  that:
+                    - (inventory_hostname == 'db1' and is_primary | bool) or (inventory_hostname != 'db1' and not (is_primary | bool))
+                    - repmgr_node_id | int >= 1
+                    - vpn_ip is match('^10\.88\.0\.')
+
+              - name: Verify vault secret if vault.yml exists
+                when: vault_smoke_secret is defined
+                ansible.builtin.assert:
+                  that:
+                    - vault_smoke_secret == "sovereign-e2e-ok"
+          YAML
+
+          chmod -R 777 /tmp/mock-zip/ansible-pg-dbaas-swarm-v3
+          (cd /tmp/mock-zip && zip -rq /tmp/ansible-pg-dbaas-swarm-v3.zip ansible-pg-dbaas-swarm-v3)
+
+          # 2. Image target minimal (tanpa python3/python3-apt/acl/sudo -> uji REMOTE_PREP!)
+          mkdir -p /tmp/target-img
+          cat > /tmp/target-img/Dockerfile <<'DOCKER'
+          FROM debian:12-slim
+          RUN apt-get update -qq && \
+              apt-get install -y -qq --no-install-recommends openssh-server && \
+              rm -rf /var/lib/apt/lists/* && \
+              mkdir -p /run/sshd && \
+              echo 'root:Day0TempPass!' | chpasswd && \
+              sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+              sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          CMD ["/usr/sbin/sshd", "-D"]
+          DOCKER
+          docker build -q -t dbaas-minimal-target /tmp/target-img
+
+      - name: Start isolated network, 5 target nodes & control node
+        run: |
+          set -euo pipefail
+          docker network create --subnet=172.28.0.0/24 dbaas-e2e-net
+
+          # Jalankan 5 target node (backup, db1, db2, db3, monitoring)
+          declare -A NODES=(
+            [backup]=172.28.0.10
+            [db1]=172.28.0.11
+            [db2]=172.28.0.12
+            [db3]=172.28.0.13
+            [monitoring]=172.28.0.20
+          )
+          for n in "${!NODES[@]}"; do
+            docker run -d --name "e2e-$n" --hostname "$n" \
+              --network dbaas-e2e-net --ip "${NODES[$n]}" \
+              --cap-add=SYS_ADMIN \
+              dbaas-minimal-target
+          done
+
+          # Uji jalur kombinasi: db1 di-bootstrap dulu via --managed (tanpa pubkey -> password tetap terbuka)
+          # sementara backup/db2/db3/monitoring dibiarkan kosongan (uji raw-SSH REMOTE_PREP)
+          docker cp "$SCRIPT_PATH" e2e-db1:/bootstrap.sh
+          docker exec e2e-db1 /bootstrap.sh --managed --hostname node-db1
+
+          # Jalankan Control Node bersih (Debian 12)
+          docker run -d --name e2e-control --hostname control-node \
+            --network dbaas-e2e-net --ip 172.28.0.5 \
+            -v "$PWD/$SCRIPT_PATH:/opt/bootstrap-1st-install.sh:ro" \
+            -v "/tmp/ansible-pg-dbaas-swarm-v3.zip:/opt/ansible-pg-dbaas-swarm-v3.zip:ro" \
+            debian:12 sleep infinity
+
+      - name: Execute Stage [1/6]..[6/6] + Ping + Auto-Deploy + Encrypted Vault Re-Run
+        run: |
+          set -euo pipefail
+
+          docker exec -i e2e-control bash -Eeuo pipefail -s <<'EOF'
+          export OVPN_PUBLIC_ENDPOINT="vpn.e2e.internal"
+          export OVPN_PORT="1195"
+          export OVPN_PROTO="udp"
+          export BACKUP_SSH_IP="172.28.0.10" BACKUP_VPN_IP="10.88.0.1"
+          export MON_SSH_IP="172.28.0.20"    MON_VPN_IP="10.88.0.20"
+          export DB_HOSTS="1:db1:172.28.0.11:10.88.0.11:manager:100:yes,2:db2:172.28.0.12:10.88.0.12:manager:90:yes,3:db3:172.28.0.13:10.88.0.13:worker:0:no"
+          export STORE_LIST_SPEC="STR01:store1:monitoring:8069:odoo_store1,STR02:store2:monitoring:8070:odoo_store2,STR03:store3:monitoring:8071:odoo_store3"
+          export SSH_PASS="Day0TempPass!"
+
+          # --- RUN 1: Full Day-0 Bootstrap + Auto-Deploy ---
+          /opt/bootstrap-1st-install.sh --control \
+            --zip /opt/ansible-pg-dbaas-swarm-v3.zip \
+            --work-dir /opt/ansible-pg-dbaas-swarm-v3 \
+            --auto-deploy
+
+          # Verifikasi artefak Control Node
+          test -x /usr/local/bin/ansible
+          test -f /root/.ssh/id_ed25519
+          test -f /root/.ssh/id_ed25519.pub
+          test -f /opt/ansible-pg-dbaas-swarm-v3/inventory/hosts.yml
+          test -f /opt/ansible-pg-dbaas-swarm-v3/.bootstrap-backup/all.yml.orig
+
+          # Pastikan direktori tidak world-writable (agar ansible.cfg dibaca)
+          [[ -z "$(find /opt/ansible-pg-dbaas-swarm-v3 -perm -0002)" ]]
+
+          # Pastikan 3 koleksi Galaxy terpasang
+          for col in community.docker community.general ansible.posix; do
+            ansible-galaxy collection list | grep -q "$col"
+          done
+
+          # --- RUN 2: Idempotensi + Encrypted vault.yml + --skip-ssh-bootstrap (tanpa SSH_PASS) ---
+          unset SSH_PASS
+          printf 'ci-vault-secret-pass\n' > /root/.vault_pass
+          chmod 600 /root/.vault_pass
+
+          cat > /opt/ansible-pg-dbaas-swarm-v3/inventory/group_vars/vault.yml <<'YAML'
+          ---
+          vault_smoke_secret: "sovereign-e2e-ok"
+          YAML
+          ansible-vault encrypt --vault-password-file /root/.vault_pass \
+            /opt/ansible-pg-dbaas-swarm-v3/inventory/group_vars/vault.yml
+
+          ANSIBLE_VAULT_PASSWORD_FILE=/root/.vault_pass \
+            /opt/bootstrap-1st-install.sh --control \
+            --work-dir /opt/ansible-pg-dbaas-swarm-v3 \
+            --skip-ssh-bootstrap \
+            --auto-deploy
+
+          # Pastikan store_nodes tidak terduplikasi setelah 2x run
+          [[ "$(grep -c '^store_nodes:' /opt/ansible-pg-dbaas-swarm-v3/inventory/group_vars/all.yml)" -eq 1 ]]
+          echo "E2E Control + 5 Nodes + Vault PASSED!"
+          EOF
+
+      - name: Verify REMOTE_PREP actually installed Python3 & ACL on barebones targets
+        run: |
+          set -euo pipefail
+          for n in backup db2 db3 monitoring; do
+            docker exec "e2e-$n" bash -c 'command -v python3 && dpkg -s python3-apt acl sudo >/dev/null'
+            echo "Verified REMOTE_PREP packages on e2e-$n"
+          done
+
+      - name: Cleanup Docker containers & network
+        if: always()
+        run: |
+          docker rm -f e2e-control e2e-backup e2e-db1 e2e-db2 e2e-db3 e2e-monitoring 2>/dev/null || true
+          docker network rm dbaas-e2e-net 2>/dev/null || true
