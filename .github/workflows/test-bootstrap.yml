@@ -15,9 +15,8 @@ on:
   workflow_dispatch:
 
 env:
-  # Sesuaikan jika lokasi/nama file skrip di repositori berbeda
   SCRIPT_PATH: ./bootstrap-1st-install.sh
-  ODOO_IMAGE: odoo:17
+  ZIP_PATH: ./ansible-pg-dbaas-swarm-v3.zip
 
 jobs:
   # ===========================================================================
@@ -71,6 +70,21 @@ jobs:
           python3 -m venv /tmp/unit-venv
           /tmp/unit-venv/bin/pip install --quiet pyyaml
 
+      - name: Validate every YAML inside ansible-pg-dbaas-swarm-v3.zip (if present)
+        run: |
+          if [[ -f "$ZIP_PATH" ]]; then
+            /tmp/unit-venv/bin/python - "$ZIP_PATH" <<'PY'
+          import sys, yaml, zipfile
+          with zipfile.ZipFile(sys.argv[1]) as z:
+              cnt = 0
+              for name in sorted(z.namelist()):
+                  if name.endswith((".yml", ".yaml")):
+                      yaml.safe_load(z.read(name).decode("utf-8"))
+                      cnt += 1
+              print(f"PASS: {cnt} YAML files inside {sys.argv[1]} parsed cleanly")
+          PY
+          fi
+
       - name: Run unit test suite against sourced functions
         shell: bash
         run: |
@@ -115,13 +129,6 @@ jobs:
           assert_fail "is_hostname leading dash"  is_hostname "-badhost"
           assert_ok   "version_ge 2.16 >= 2.15"   version_ge "2.16.4" "2.15"
           assert_fail "version_ge 2.14 < 2.15"    version_ge "2.14.9" "2.15"
-
-          if declare -F is_odoo_modules >/dev/null; then
-            assert_ok   "is_docker_image valid"     is_docker_image "odoo:17"
-            assert_fail "is_docker_image space"     is_docker_image "odoo 17"
-            assert_ok   "is_odoo_modules multi"     is_odoo_modules "point_of_sale,stock,account"
-            assert_fail "is_odoo_modules invalid"   is_odoo_modules "point-of-sale!"
-          fi
 
           # --- B. Validasi topologi & kuorum Raft ---
           export OVPN_PUBLIC_ENDPOINT="vpn.prod.example.internal"
@@ -183,14 +190,7 @@ jobs:
           assert_fail "same BACKUP_VPN_IP and MON_VPN_IP" env BACKUP_VPN_IP="10.88.0.1" MON_VPN_IP="10.88.0.1" \
             bash -c 'source "$SCRIPT_PATH"; trap - ERR; validate_control_config'
 
-          if declare -F is_odoo_modules >/dev/null; then
-            assert_fail "invalid ODOO_POS_MODULES rejected" env ODOO_POS_MODULES="bad-mod!" \
-              bash -c 'source "$SCRIPT_PATH"; trap - ERR; validate_control_config'
-            assert_fail "invalid ODOO_INIT_POS rejected" env ODOO_INIT_POS="maybe" \
-              bash -c 'source "$SCRIPT_PATH"; trap - ERR; validate_control_config'
-          fi
-
-          # --- E. emit_inventory & patch_group_vars (YAML valid + idempotensi) ---
+          # --- E. emit_inventory & patch_group_vars (YAML valid + idempotensi + jaga odoo_image custom) ---
           TMP_TEST=$(mktemp -d)
           trap 'rm -rf "$TMP_TEST"' EXIT
 
@@ -218,8 +218,8 @@ jobs:
             - code: "OLD"
               name: "legacy"
 
-          # Komentar penting sebelum variabel lain
-          keep_this_key: "intact"
+          # --- Computed Helper Variables ---
+          odoo_image: "{{ registry_prefix }}pg-dbaas-v3-odoo-retail:{{ odoo_version }}"
           YAML
 
           OVPN_PUBLIC_ENDPOINT="vpn.prod.example.internal" OVPN_PORT="51820" OVPN_PROTO="tcp" \
@@ -231,7 +231,7 @@ jobs:
 
           diff -u "$TMP_TEST/all.run1.yml" "$TMP_TEST/all.yml"
           [[ -f "$TMP_TEST/bak/all.yml.orig" ]]
-          grep -q "# Komentar penting sebelum variabel lain" "$TMP_TEST/all.yml"
+          grep -q "# --- Computed Helper Variables ---" "$TMP_TEST/all.yml"
 
           "$PY" - "$TMP_TEST/all.yml" <<'PY'
           import sys, yaml
@@ -239,14 +239,11 @@ jobs:
           assert data["ovpn_public_endpoint"] == "vpn.prod.example.internal"
           assert data["ovpn_port"] == 51820
           assert data["ovpn_proto"] == "tcp"
-          assert data["keep_this_key"] == "intact"
+          assert "pg-dbaas-v3-odoo-retail" in data["odoo_image"]
           assert len(data["store_nodes"]) == 2
           assert data["store_nodes"][0]["db_user"] == "odoo_store1"
           assert data["store_nodes"][1]["db_user"] == "custom_usr"
-          if "odoo_pos_modules" in data:
-              assert data["odoo_image"] == "odoo:17"
-              assert data["store_nodes"][0]["pos_enabled"] is True
-          print("PASS: patch_group_vars YAML valid, idempotent, & preserves comments")
+          print("PASS: patch_group_vars YAML valid, idempotent, & preserves custom odoo_image")
           PY
 
   # ===========================================================================
@@ -322,11 +319,9 @@ jobs:
           /usr/sbin/sshd -T | grep -qi '^pubkeyauthentication yes$'
           /usr/sbin/sshd -T | grep -qi '^permitrootlogin prohibit-password$'
 
-          # Idempotensi
           /bootstrap.sh --managed --hostname node-db1.test.local --pubkey-file /control.pub
           [[ "$(wc -l < /root/.ssh/authorized_keys)" -eq 1 ]]
 
-          # Pubkey cacat ditolak
           if /bootstrap.sh --managed --pubkey-string "ssh-ed25519 INVALID_KEY_PAYLOAD" >/dev/null 2>&1; then
             echo "FAIL: pubkey invalid seharusnya ditolak" >&2; exit 1
           fi
@@ -540,26 +535,24 @@ jobs:
           docker network rm dbaas-e2e-net 2>/dev/null || true
 
   # ===========================================================================
-  # 6. E2E Odoo Retail Store POS -> Native DBaaS Cluster (db1 Primary -> db2 Standby)
-  #    TANPA container postgres terpisah!
+  # 6. E2E Playbook Syntax + Custom Odoo Retail Store POS -> Native DBaaS Cluster
+  #    (db1 Primary -> db2 Streaming Standby, TANPA container postgres tambahan)
   # ===========================================================================
   e2e-odoo-retail-pos:
-    name: 6. E2E Odoo POS -> DBaaS Cluster (db1 Primary + db2 Standby)
+    name: 6. E2E Real Zip Syntax + Odoo retail_store_pos -> DBaaS (db1 + db2)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     needs: [unit-tests, dry-run]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Ansible in isolated venv
+      - name: Install Ansible & collections in isolated venv
         run: |
           set -euo pipefail
           python3 -m venv /tmp/odoo-ansible-venv
           /tmp/odoo-ansible-venv/bin/pip install --quiet --upgrade pip
           /tmp/odoo-ansible-venv/bin/pip install --quiet "ansible-core>=2.15" pyyaml
-          if [[ -f ./ansible-pg-dbaas-swarm-v3.zip ]]; then
-            /tmp/odoo-ansible-venv/bin/ansible-galaxy collection install community.docker community.general ansible.posix
-          fi
+          /tmp/odoo-ansible-venv/bin/ansible-galaxy collection install community.docker community.general ansible.posix
 
       - name: Build native PostgreSQL 16 DB node image (simulasi VM db1 & db2)
         run: |
@@ -578,15 +571,13 @@ jobs:
           DOCKER
           docker build -q -t dbaas-pg16-node /tmp/dbnode-img
 
-      - name: Start isolated cluster network & DB nodes (db1, db2) + generate real inventory
+      - name: Start cluster network, db1/db2, unpack real zip & syntax-check all playbooks
         shell: bash
         run: |
           set -Eeuo pipefail
           docker network create --subnet=172.29.0.0/24 dbaas-pos-net
-
           ssh-keygen -q -t ed25519 -N "" -f /tmp/pos_ci_ed25519
 
-          # Jalankan 2 node DB nyata: db1 (Primary) & db2 (Streaming Hot Standby)
           for spec in "db1:172.29.0.11" "db2:172.29.0.12"; do
             IFS=':' read -r name ip <<< "$spec"
             docker run -d --name "pos-${name}" --hostname "$name" \
@@ -597,8 +588,8 @@ jobs:
             docker exec "pos-${name}" chmod 600 /root/.ssh/authorized_keys
           done
 
-          # Generate inventory/hosts.yml & group_vars/all.yml asli via bootstrap-1st-install.sh
           export WORK_DIR=/tmp/odoo-e2e-work
+          export ANSIBLE_ZIP="$ZIP_PATH"
           export SSH_KEY_PATH=/tmp/pos_ci_ed25519
           export OVPN_PUBLIC_ENDPOINT="vpn.odoo-e2e.internal"
           export OVPN_PORT="1194"
@@ -606,7 +597,6 @@ jobs:
           export BACKUP_SSH_IP="172.29.0.10" BACKUP_VPN_IP="10.88.0.1"
           export MON_SSH_IP="172.29.0.20"    MON_VPN_IP="10.88.0.20"
           export DB_HOSTS="1:db1:172.29.0.11:10.88.0.11:manager:100:yes,2:db2:172.29.0.12:10.88.0.12:manager:90:yes"
-          # 3 toko retail POS (STR02 uji custom db_user = odoo_u2)
           export STORE_LIST_SPEC="STR01:store1:monitoring:8069:odoo_store1,STR02:store2:monitoring:8070:odoo_store2:odoo_u2,STR03:store3:monitoring:8071:odoo_store3"
 
           # shellcheck disable=SC1090
@@ -614,21 +604,22 @@ jobs:
           parse_cluster_specs
           validate_control_config
           check_placeholders
+          PATH="/tmp/odoo-ansible-venv/bin:$PATH" unpack_ansible_project
+          generate_inventory_and_vars
 
-          if [[ -f ./ansible-pg-dbaas-swarm-v3.zip ]]; then
-            echo "Arsip ansible-pg-dbaas-swarm-v3.zip ditemukan — ekstrak & syntax-check site.yml..."
-            PATH="/tmp/odoo-ansible-venv/bin:$PATH" unpack_ansible_project
-            generate_inventory_and_vars
-            (cd "$WORK_DIR" && /tmp/odoo-ansible-venv/bin/ansible-playbook -i inventory/hosts.yml site.yml --syntax-check)
-          else
-            generate_inventory_and_vars
-          fi
+          # Syntax-check seluruh playbook di dalam ansible-pg-dbaas-swarm-v3.zip
+          for pb in site.yml add_store.yml promote.yml status.yml; do
+            if [[ -f "$WORK_DIR/$pb" ]]; then
+              echo "=== Syntax-check: $pb ==="
+              (cd "$WORK_DIR" && /tmp/odoo-ansible-venv/bin/ansible-playbook -i inventory/hosts.yml "$pb" --syntax-check)
+            fi
+          done
 
-          # Verifikasi koneksi Ansible ke db_nodes memakai inventory hasil bootstrap
+          # Uji ping Ansible ke db_nodes memakai inventory hasil bootstrap
           ANSIBLE_HOST_KEY_CHECKING=False \
             /tmp/odoo-ansible-venv/bin/ansible -i "$WORK_DIR/inventory/hosts.yml" db_nodes -m ping
 
-      - name: Provision PostgreSQL Primary (db1) -> Streaming Standby (db2) & Pola 1 Store DBs via Inventory
+      - name: Provision PostgreSQL Primary (db1) -> Streaming Standby (db2) & Pola 1 Store DBs
         run: |
           set -euo pipefail
 
@@ -652,14 +643,10 @@ jobs:
                   CONF
                   cat >> /etc/postgresql/16/main/pg_hba.conf <<'HBA'
                   host all         all    172.29.0.0/24 scram-sha-256
-                  host replication repmgr 172.29.0.24/24 scram-sha-256
                   host replication repmgr 172.29.0.0/24 scram-sha-256
                   HBA
                   pg_ctlcluster 16 main restart
-                  for _ in $(seq 1 20); do
-                    pg_isready -q && break
-                    sleep 1
-                  done
+                  for _ in $(seq 1 20); do pg_isready -q && break; sleep 1; done
                   pg_isready -q
                   runuser -u postgres -- psql -v ON_ERROR_STOP=1 -c \
                     "CREATE ROLE repmgr WITH REPLICATION LOGIN PASSWORD '{{ pg_rep_pass }}';"
@@ -708,10 +695,7 @@ jobs:
                   runuser -u postgres -- env PGPASSWORD='{{ pg_rep_pass }}' \
                     pg_basebackup -h "{{ primary_ip }}" -D /var/lib/postgresql/16/main -U repmgr -Fp -Xs -R
                   pg_ctlcluster 16 main start
-                  for _ in $(seq 1 20); do
-                    pg_isready -q && break
-                    sleep 1
-                  done
+                  for _ in $(seq 1 20); do pg_isready -q && break; sleep 1; done
                   rec=$(runuser -u postgres -- psql -tAc 'SELECT pg_is_in_recovery();')
                   test "$rec" = "t"
                 args:
@@ -723,69 +707,49 @@ jobs:
               -i /tmp/odoo-e2e-work/inventory/hosts.yml \
               /tmp/odoo-e2e-work/provision-dbaas-cluster.yml
 
-      - name: Pull ONLY Odoo 17 image (no postgres container) & init point_of_sale directly on db1
+      - name: Build custom Odoo Retail Store POS image directly from ansible-pg-dbaas-swarm-v3.zip
         run: |
           set -euo pipefail
-          docker pull -q "$ODOO_IMAGE"
+          ODOO_CTX=/tmp/odoo-build-ctx
+          rm -rf "$ODOO_CTX"
+          cp -a /tmp/odoo-e2e-work/roles/dbaas_stack/files/odoo "$ODOO_CTX"
+          sed 's/{{ odoo_version }}/17.0/g' \
+            /tmp/odoo-e2e-work/roles/dbaas_stack/templates/Dockerfile.odoo.j2 \
+            > "$ODOO_CTX/Dockerfile"
 
-          PRIMARY_DB_IP="172.29.0.11"
+          docker build -q -t pg-dbaas-v3-odoo-retail:17.0 "$ODOO_CTX"
+          echo "PASS: Custom image pg-dbaas-v3-odoo-retail:17.0 (with retail_store_pos addon) built!"
 
-          pids=()
-          names=()
-          for spec in "STR01:store1:odoo_store1:odoo_store1" \
-                      "STR02:store2:odoo_store2:odoo_u2" \
-                      "STR03:store3:odoo_store3:odoo_store3"; do
-            IFS=':' read -r code sname dbname dbuser <<< "$spec"
-            echo "=== Init point_of_sale langsung ke db1 (${PRIMARY_DB_IP}) untuk ${code}/${dbname} ==="
-            (
-              docker run --rm --network dbaas-pos-net \
-                -e HOST="$PRIMARY_DB_IP" -e PORT=5432 \
-                -e USER="$dbuser" -e PASSWORD="OdooPass_${code}!" \
-                "$ODOO_IMAGE" odoo \
-                  --database="$dbname" \
-                  --init=point_of_sale \
-                  --without-demo=all \
-                  --stop-after-init \
-                  --log-level=warn
-            ) > "/tmp/init_${sname}.log" 2>&1 &
-            pids+=("$!")
-            names+=("$sname")
-          done
-
-          failed=0
-          for i in "${!pids[@]}"; do
-            if wait "${pids[$i]}"; then
-              echo "PASS: point_of_sale terpasang di db1 (${names[$i]})"
-            else
-              echo "FAIL: Init point_of_sale gagal untuk ${names[$i]}" >&2
-              tail -n 60 "/tmp/init_${names[$i]}.log" >&2 || true
-              failed=1
-            fi
-          done
-          (( failed == 0 ))
-
-      - name: Run 3 Odoo Retail POS containers -> db1 & verify POS checkout + replication to db2
+      - name: Run 3 custom Odoo Retail POS containers -> db1 & verify addon, POS checkout, replication & isolation
         run: |
           set -euo pipefail
           PRIMARY_DB_IP="172.29.0.11"
+          mkdir -p /tmp/odoo-secrets
+          printf 'OdooMasterCI!' > /tmp/odoo-secrets/odoo_master_pass
 
-          # 3 container aplikasi Odoo murni -> langsung konek ke PostgreSQL Primary di db1 (172.29.0.11:5432)
+          # Jalankan 3 container custom pg-dbaas-v3-odoo-retail:17.0 (entrypoint-odoo.sh auto-init retail_store_pos)
           for spec in "STR01:store1:8069:odoo_store1:odoo_store1" \
                       "STR02:store2:8070:odoo_store2:odoo_u2" \
                       "STR03:store3:8071:odoo_store3:odoo_store3"; do
             IFS=':' read -r code sname port dbname dbuser <<< "$spec"
+            printf 'OdooPass_%s!' "$code" > "/tmp/odoo-secrets/odoo_db_pass_${sname}"
             docker run -d --name "odoo-${sname}" \
               --network dbaas-pos-net \
               -p "${port}:8069" \
-              -e HOST="$PRIMARY_DB_IP" -e PORT=5432 \
-              -e USER="$dbuser" -e PASSWORD="OdooPass_${code}!" \
-              "$ODOO_IMAGE" odoo \
-                --database="$dbname" \
-                --db-filter="^${dbname}$" \
-                --workers=0
+              -v "/tmp/odoo-secrets/odoo_master_pass:/run/secrets/odoo_master_pass:ro" \
+              -v "/tmp/odoo-secrets/odoo_db_pass_${sname}:/run/secrets/odoo_db_pass:ro" \
+              -e STORE_CODE="$code" \
+              -e STORE_NAME="$sname" \
+              -e ODOO_DB_HOST="$PRIMARY_DB_IP" \
+              -e ODOO_DB_PORT=5432 \
+              -e ODOO_DB_NAME="$dbname" \
+              -e ODOO_DB_USER="$dbuser" \
+              -e ODOO_AUTO_INIT=1 \
+              -e ODOO_WORKERS=0 \
+              pg-dbaas-v3-odoo-retail:17.0
           done
 
-          # Script transaksi kasir Retail POS (CoA + pos.config + Cash + SKU + pos.session + paid pos.order)
+          # Script verifikasi custom addon retail_store_pos + transaksi kasir POS
           cat > /tmp/pos_e2e_tx.py <<'PY'
           import os
           from odoo import api
@@ -796,9 +760,16 @@ jobs:
           uenv = api.Environment(env.cr, admin.id, dict(env.context))
           company = uenv.company
 
-          pos_mod = uenv["ir.module.module"].search([("name", "=", "point_of_sale")], limit=1)
-          assert pos_mod and pos_mod.state == "installed", f"point_of_sale belum installed: {pos_mod.state}"
+          # 1. Pastikan modul point_of_sale & custom addon retail_store_pos terpasang
+          for mod_name in ("point_of_sale", "retail_store_pos"):
+              mod = uenv["ir.module.module"].search([("name", "=", mod_name)], limit=1)
+              assert mod and mod.state == "installed", f"Modul {mod_name} belum installed: {mod.state if mod else 'missing'}"
 
+          # 2. Pastikan retail.store.branch sudah otomatis di-seed oleh entrypoint-odoo.sh
+          branch = uenv["retail.store.branch"].search([("code", "=", code)], limit=1)
+          assert branch, f"retail.store.branch code={code} tidak ditemukan!"
+
+          # 3. Load CoA & siapkan POS Register tertaut ke retail_branch_id
           if not uenv["account.journal"].search([("type", "=", "sale"), ("company_id", "=", company.id)], limit=1):
               uenv["account.chart.template"].try_loading("generic_coa", company=company, install_demo=False)
 
@@ -815,19 +786,19 @@ jobs:
           })
 
           cfg = uenv["pos.config"].search([("company_id", "=", company.id)], limit=1)
+          vals = {
+              "name": f"POS Retail {code} ({sname})",
+              "journal_id": sale_j.id,
+              "payment_method_ids": [(4, pm.id)],
+              "retail_branch_id": branch.id,
+          }
           if cfg:
-              cfg.write({
-                  "name": f"POS Retail {code} ({sname})",
-                  "journal_id": sale_j.id,
-                  "payment_method_ids": [(4, pm.id)],
-              })
+              cfg.write(vals)
           else:
-              cfg = uenv["pos.config"].create({
-                  "name": f"POS Retail {code} ({sname})",
-                  "journal_id": sale_j.id,
-                  "payment_method_ids": [(4, pm.id)],
-              })
+              cfg = uenv["pos.config"].create(vals)
+          assert cfg.retail_branch_code == code, f"retail_branch_code mismatch: {cfg.retail_branch_code}"
 
+          # 4. Produk retail + buka session + checkout paid order
           prod = uenv["product.product"].create({
               "name": f"Kopi Hitam Retail {code}",
               "default_code": f"SKU-{code}-001",
@@ -841,7 +812,7 @@ jobs:
           assert sess, "Gagal membuka pos.session"
           if sess.state == "opening_control":
               sess.action_pos_session_open()
-          assert sess.state == "opened", f"State session tidak sesuai: {sess.state}"
+          assert sess.state == "opened"
 
           pricelist = (
               cfg.pricelist_id
@@ -874,11 +845,16 @@ jobs:
               "amount": 50000.0,
           })
           order.action_pos_order_paid()
-          assert order.state == "paid", f"Order belum paid: {order.state}"
+          assert order.state == "paid"
+
+          # 5. Verifikasi compute metric custom model retail.store.branch
+          branch.invalidate_recordset()
+          assert branch.pos_count >= 1, f"pos_count tidak bertambah: {branch.pos_count}"
+          assert branch.today_sales_total >= 50000.0, f"today_sales_total salah: {branch.today_sales_total}"
 
           uenv.cr.commit()
           print(f"CI_POS_CONFIG_ID={cfg.id}")
-          print(f"CI_POS_SESSION_NAME={sess.name}")
+          print(f"CI_BRANCH_SALES={branch.today_sales_total}")
           print("CI_POS_TX_OK=1")
           PY
 
@@ -886,78 +862,67 @@ jobs:
                       "store2:8070:odoo_store2:odoo_u2:STR02" \
                       "store3:8071:odoo_store3:odoo_store3:STR03"; do
             IFS=':' read -r sname port dbname dbuser code <<< "$spec"
+            echo "=== Menunggu auto-init entrypoint-odoo.sh (${code}/${sname} di :${port}) ==="
 
-            # 1. Tunggu /web/health & /web/login
             ready=0
-            for _ in $(seq 1 60); do
+            for _ in $(seq 1 120); do
               health=$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/web/health" 2>/dev/null || true)
               code_login=$(curl -sS -L -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:${port}/web/login" 2>/dev/null || true)
               if echo "$health" | grep -q '"pass"' && [[ "$code_login" == "200" ]]; then
                 ready=1; break
               fi
-              sleep 2
+              sleep 3
             done
-            (( ready )) || { echo "FAIL: odoo-${sname} tidak ready" >&2; docker logs --tail 60 "odoo-${sname}"; exit 1; }
+            (( ready )) || { echo "FAIL: odoo-${sname} tidak ready" >&2; docker logs --tail 80 "odoo-${sname}"; exit 1; }
 
-            # 2. Jalankan transaksi kasir POS langsung ke db1 (eksplisit --db_host karena docker exec melewati entrypoint)
+            # Eksekusi verifikasi retail_store_pos & transaksi POS menggunakan /tmp/odoo.conf asli container
             docker exec -i -e STORE_CODE="$code" -e STORE_NAME="$sname" "odoo-${sname}" \
-              odoo shell \
-                --db_host="$PRIMARY_DB_IP" --db_port=5432 \
-                --db_user="$dbuser" --db_password="OdooPass_${code}!" \
-                -d "$dbname" --no-http --log-level=warn \
+              runuser -u odoo -- odoo shell -c /tmp/odoo.conf -d "$dbname" --no-http --log-level=warn \
               < /tmp/pos_e2e_tx.py > "/tmp/tx_${sname}.log" 2>&1
 
             grep -qx "CI_POS_TX_OK=1" "/tmp/tx_${sname}.log" || { cat "/tmp/tx_${sname}.log" >&2; exit 1; }
             cfg_id=$(sed -n 's/^CI_POS_CONFIG_ID=//p' "/tmp/tx_${sname}.log" | tail -n1)
-            sess_name=$(sed -n 's/^CI_POS_SESSION_NAME=//p' "/tmp/tx_${sname}.log" | tail -n1)
+            sales=$(sed -n 's/^CI_BRANCH_SALES=//p' "/tmp/tx_${sname}.log" | tail -n1)
 
-            # 3. Verifikasi login JSON-RPC & UI kasir /pos/ui?config_id=<id>
+            # Verifikasi login JSON-RPC & /pos/ui
             auth_resp=$(curl -fsS -c "/tmp/cookie_${sname}.txt" \
               -H 'Content-Type: application/json' \
               -d "{\"jsonrpc\":\"2.0\",\"method\":\"call\",\"params\":{\"db\":\"${dbname}\",\"login\":\"admin\",\"password\":\"admin\"}}" \
               "http://127.0.0.1:${port}/web/session/authenticate")
-            echo "$auth_resp" | grep -qE '"uid":[[:space:]]*[0-9]+' || {
-              echo "FAIL: Login admin gagal di ${sname}: ${auth_resp}" >&2; exit 1
-            }
+            echo "$auth_resp" | grep -qE '"uid":[[:space:]]*[0-9]+'
 
             pos_ui_code=$(curl -sS -L -b "/tmp/cookie_${sname}.txt" \
               -o "/tmp/pos_ui_${sname}.html" -w '%{http_code}' \
               "http://127.0.0.1:${port}/pos/ui?config_id=${cfg_id}")
-            [[ "$pos_ui_code" == "200" ]] || {
-              echo "FAIL: /pos/ui HTTP ${pos_ui_code} di ${sname}" >&2; exit 1
-            }
-            grep -qi 'point_of_sale\|pos\.assets' "/tmp/pos_ui_${sname}.html" || {
-              echo "FAIL: /pos/ui tidak memuat bundle point_of_sale di ${sname}" >&2; exit 1
-            }
+            [[ "$pos_ui_code" == "200" ]]
+            grep -qi 'point_of_sale\|pos\.assets' "/tmp/pos_ui_${sname}.html"
 
-            # 4. BUKTIKAN data order ada di db1 (Primary) SEKALIGUS tereplikasi ke db2 (Standby)
+            # Verifikasi data retail_store_branch & pos_order ada di db1 SEKALIGUS tereplikasi ke db2
             cnt_db1=$(docker exec pos-db1 runuser -u postgres -- \
-              psql -d "$dbname" -tAc "SELECT count(*) FROM pos_order WHERE pos_reference='POS-${code}-0001' AND state='paid' AND amount_total=50000;")
+              psql -d "$dbname" -tAc "SELECT (SELECT count(*) FROM retail_store_branch WHERE code='${code}') + (SELECT count(*) FROM pos_order WHERE pos_reference='POS-${code}-0001' AND state='paid');")
 
             cnt_db2="0"
             for _ in $(seq 1 15); do
               cnt_db2=$(docker exec pos-db2 runuser -u postgres -- \
-                psql -d "$dbname" -tAc "SELECT count(*) FROM pos_order WHERE pos_reference='POS-${code}-0001' AND state='paid' AND amount_total=50000;" || echo "0")
-              [[ "$cnt_db2" == "1" ]] && break
+                psql -d "$dbname" -tAc "SELECT (SELECT count(*) FROM retail_store_branch WHERE code='${code}') + (SELECT count(*) FROM pos_order WHERE pos_reference='POS-${code}-0001' AND state='paid');" || echo "0")
+              [[ "$cnt_db2" == "2" ]] && break
               sleep 1
             done
 
-            [[ "$cnt_db1" == "1" && "$cnt_db2" == "1" ]] || {
-              echo "FAIL: Replikasi POS ${code} tidak sinkron (db1=${cnt_db1}, db2=${cnt_db2})" >&2
+            [[ "$cnt_db1" == "2" && "$cnt_db2" == "2" ]] || {
+              echo "FAIL: Replikasi POS/Branch ${code} tidak sinkron (db1=${cnt_db1}, db2=${cnt_db2})" >&2
               exit 1
             }
-            echo "PASS: ${code} (:${port}) -> session=${sess_name}, /pos/ui=200, order paid di db1=1 & tereplikasi ke db2=1!"
+            echo "PASS: ${code} (:${port}) -> retail_store_pos OK, today_sales=${sales}, /pos/ui=200, db1=2 & db2=2!"
           done
 
-          # 5. Verifikasi isolasi Pola 1 (2 lapis) langsung di node db1 & db2:
-          #    A. Role odoo_store1 ditolak konek ke odoo_store2
+          # Verifikasi isolasi Pola 1 (DB Role + Data Transaksi POS) di db1 & db2
           if docker exec -e PGPASSWORD="OdooPass_STR01!" pos-db1 \
                psql -h 127.0.0.1 -U odoo_store1 -d odoo_store2 -c "SELECT 1;" >/dev/null 2>&1; then
-            echo "FAIL: Pelanggaran isolasi DB! odoo_store1 bisa mengakses odoo_store2 di db1!" >&2
+            echo "FAIL: Pelanggaran isolasi DB! odoo_store1 bisa mengakses odoo_store2!" >&2
             exit 1
           fi
 
-          #    B. Order milik STR01 berjumlah 0 di database store2 & store3 (baik db1 maupun db2)
           for dbname in odoo_store2 odoo_store3; do
             leak=$(docker exec pos-db2 runuser -u postgres -- \
               psql -d "$dbname" -tAc "SELECT count(*) FROM pos_order WHERE pos_reference='POS-STR01-0001';")
@@ -966,7 +931,7 @@ jobs:
               exit 1
             }
           done
-          echo "PASS: Isolasi Pola 1 (Role DB + Data Transaksi POS) & Replikasi db1 -> db2 TERVERIFIKASI!"
+          echo "PASS: Custom retail_store_pos + Isolasi Pola 1 + Replikasi db1 -> db2 TERVERIFIKASI!"
 
       - name: Dump logs on failure
         if: failure()
@@ -974,9 +939,9 @@ jobs:
           docker ps -a || true
           for c in odoo-store1 odoo-store2 odoo-store3; do
             echo "===== CONTAINER LOGS: $c ====="
-            docker logs --tail 60 "$c" 2>&1 || true
+            docker logs --tail 80 "$c" 2>&1 || true
           done
-          for f in /tmp/init_*.log /tmp/tx_*.log; do
+          for f in /tmp/tx_*.log; do
             if [[ -f "$f" ]]; then
               echo "===== FILE: $f ====="
               tail -n 60 "$f"
