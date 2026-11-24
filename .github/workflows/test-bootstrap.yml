@@ -828,7 +828,6 @@ jobs:
                   "invoice_journal_id": sale_j.id,
                   "payment_method_ids": [(6, 0, [pm.id])],
                   "pricelist_id": pricelist.id,
-                  "cash_control": False,
                   "retail_branch_id": branch.id,
               }
               if cfg:
@@ -837,7 +836,7 @@ jobs:
                   cfg = uenv["pos.config"].create(vals)
               assert cfg.retail_branch_code == code, f"retail_branch_code mismatch: {cfg.retail_branch_code}"
 
-              # 4. Produk retail + buka session secara eksplisit + checkout paid order
+              # 4. Produk retail + buka session (termasuk konfirmasi cashbox Odoo 17) + checkout paid order
               prod = uenv["product.product"].create({
                   "name": f"Kopi Hitam Retail {code}",
                   "default_code": f"SKU-{code}-001",
@@ -854,6 +853,8 @@ jobs:
                   })
               if sess.state == "opening_control":
                   sess.action_pos_session_open()
+              if sess.state == "opening_control":
+                  sess.set_cashbox_pos(0.0, "CI Opening Cash")
               assert sess.state == "opened", f"State session tidak sesuai: {sess.state}"
 
               order = uenv["pos.order"].create({
@@ -949,7 +950,7 @@ jobs:
               head -c 500 "/tmp/pos_ui_${sname}.html" >&2 || true
               exit 1
             fi
-            if ! grep -qi 'point_of_sale\|pos\.assets\|odoo\.info' "/tmp/pos_ui_${sname}.html"; then
+            if ! grep -qi 'point_of_sale\|pos\.assets\|__session_info__\|odoo\.info' "/tmp/pos_ui_${sname}.html"; then
               echo "FAIL: Halaman /pos/ui di ${sname} tidak memuat bundle POS:" >&2
               head -c 500 "/tmp/pos_ui_${sname}.html" >&2 || true
               exit 1
