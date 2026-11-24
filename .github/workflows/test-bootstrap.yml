@@ -565,8 +565,9 @@ jobs:
               apt-get install -y -qq --no-install-recommends \
                 openssh-server python3 python3-apt sudo acl postgresql-16 postgresql-client-16 && \
               rm -rf /var/lib/apt/lists/* && \
-              mkdir -p /run/sshd && \
-              sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+              mkdir -p /run/sshd /etc/ssh/sshd_config.d && \
+              usermod -p '*' root && \
+              printf 'PermitRootLogin prohibit-password\nPubkeyAuthentication yes\n' > /etc/ssh/sshd_config.d/00-ci.conf
           CMD ["/usr/sbin/sshd", "-D"]
           DOCKER
           docker build -q -t dbaas-pg16-node /tmp/dbnode-img
@@ -583,9 +584,13 @@ jobs:
             docker run -d --name "pos-${name}" --hostname "$name" \
               --network dbaas-pos-net --ip "$ip" \
               dbaas-pg16-node
-            docker exec "pos-${name}" bash -c 'install -d -m 700 /root/.ssh'
-            docker cp /tmp/pos_ci_ed25519.pub "pos-${name}:/root/.ssh/authorized_keys"
-            docker exec "pos-${name}" chmod 600 /root/.ssh/authorized_keys
+            docker exec -i "pos-${name}" bash -euo pipefail -c \
+              'install -d -m 700 -o root -g root /root/.ssh && cat > /root/.ssh/authorized_keys && chown root:root /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys' \
+              < /tmp/pos_ci_ed25519.pub
+            for _ in $(seq 1 15); do
+              timeout 1 bash -c ">/dev/tcp/${ip}/22" 2>/dev/null && break
+              sleep 1
+            done
           done
 
           export WORK_DIR=/tmp/odoo-e2e-work
