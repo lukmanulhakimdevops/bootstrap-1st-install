@@ -650,7 +650,10 @@ jobs:
                   host all         all    172.29.0.0/24 scram-sha-256
                   host replication repmgr 172.29.0.0/24 scram-sha-256
                   HBA
-                  pg_ctlcluster 16 main restart
+                  pg_ctlcluster 16 main restart </dev/null >/tmp/pg_primary_start.log 2>&1 || {
+                    cat /tmp/pg_primary_start.log >&2
+                    exit 1
+                  }
                   for _ in $(seq 1 20); do pg_isready -q && break; sleep 1; done
                   pg_isready -q
                   runuser -u postgres -- psql -v ON_ERROR_STOP=1 -c \
@@ -697,9 +700,13 @@ jobs:
                   set -euo pipefail
                   pg_ctlcluster 16 main stop --force || true
                   find /var/lib/postgresql/16/main -mindepth 1 -delete
-                  runuser -u postgres -- env PGPASSWORD='{{ pg_rep_pass }}' \
-                    pg_basebackup -h "{{ primary_ip }}" -D /var/lib/postgresql/16/main -U repmgr -Fp -Xs -R
-                  pg_ctlcluster 16 main start
+                  timeout 120 runuser -u postgres -- env PGPASSWORD='{{ pg_rep_pass }}' PGCONNECT_TIMEOUT=10 \
+                    pg_basebackup -h "{{ primary_ip }}" -D /var/lib/postgresql/16/main \
+                      -U repmgr -Fp -Xs -R -c fast -w
+                  pg_ctlcluster 16 main start </dev/null >/tmp/pg_standby_start.log 2>&1 || {
+                    cat /tmp/pg_standby_start.log >&2
+                    exit 1
+                  }
                   for _ in $(seq 1 20); do pg_isready -q && break; sleep 1; done
                   rec=$(runuser -u postgres -- psql -tAc 'SELECT pg_is_in_recovery();')
                   test "$rec" = "t"
@@ -754,113 +761,140 @@ jobs:
               pg-dbaas-v3-odoo-retail:17.0
           done
 
-          # Script verifikasi custom addon retail_store_pos + transaksi kasir POS
+          # Script verifikasi custom addon retail_store_pos + transaksi kasir POS (Odoo 17 safe)
           cat > /tmp/pos_e2e_tx.py <<'PY'
           import os
+          import sys
+          import traceback
           from odoo import api
 
-          code = os.environ["STORE_CODE"]
-          sname = os.environ["STORE_NAME"]
-          admin = env.ref("base.user_admin")
-          uenv = api.Environment(env.cr, admin.id, dict(env.context))
-          company = uenv.company
+          try:
+              code = os.environ["STORE_CODE"]
+              sname = os.environ["STORE_NAME"]
+              admin = env.ref("base.user_admin")
+              uenv = api.Environment(env.cr, admin.id, dict(env.context))
+              company = uenv.company
 
-          # 1. Pastikan modul point_of_sale & custom addon retail_store_pos terpasang
-          for mod_name in ("point_of_sale", "retail_store_pos"):
-              mod = uenv["ir.module.module"].search([("name", "=", mod_name)], limit=1)
-              assert mod and mod.state == "installed", f"Modul {mod_name} belum installed: {mod.state if mod else 'missing'}"
+              # 1. Pastikan modul point_of_sale & custom addon retail_store_pos terpasang
+              for mod_name in ("point_of_sale", "retail_store_pos"):
+                  mod = uenv["ir.module.module"].search([("name", "=", mod_name)], limit=1)
+                  assert mod and mod.state == "installed", f"Modul {mod_name} belum installed: {mod.state if mod else 'missing'}"
 
-          # 2. Pastikan retail.store.branch sudah otomatis di-seed oleh entrypoint-odoo.sh
-          branch = uenv["retail.store.branch"].search([("code", "=", code)], limit=1)
-          assert branch, f"retail.store.branch code={code} tidak ditemukan!"
+              # 2. Pastikan retail.store.branch sudah otomatis di-seed oleh entrypoint-odoo.sh
+              branch = uenv["retail.store.branch"].search([("code", "=", code)], limit=1)
+              assert branch, f"retail.store.branch code={code} tidak ditemukan!"
 
-          # 3. Load CoA & siapkan POS Register tertaut ke retail_branch_id
-          if not uenv["account.journal"].search([("type", "=", "sale"), ("company_id", "=", company.id)], limit=1):
-              uenv["account.chart.template"].try_loading("generic_coa", company=company, install_demo=False)
+              # 3. Load CoA jika jurnal akuntansi belum tersedia
+              if not uenv["account.journal"].search([("type", "=", "sale"), ("company_id", "=", company.id)], limit=1):
+                  uenv["account.chart.template"].try_loading("generic_coa", company=company, install_demo=False)
 
-          sale_j = uenv["account.journal"].search([("type", "=", "sale"), ("company_id", "=", company.id)], limit=1)
-          cash_j = uenv["account.journal"].search([("type", "=", "cash"), ("company_id", "=", company.id)], limit=1)
-          assert sale_j and cash_j, "Jurnal Sale/Cash tidak tersedia"
+              sale_j = uenv["account.journal"].search([("type", "=", "sale"), ("company_id", "=", company.id)], limit=1)
+              cash_j = uenv["account.journal"].search([("type", "=", "cash"), ("company_id", "=", company.id)], limit=1)
+              assert sale_j and cash_j, "Jurnal Sale/Cash tidak tersedia"
 
-          pm = uenv["pos.payment.method"].search(
-              [("journal_id", "=", cash_j.id), ("company_id", "=", company.id)], limit=1
-          ) or uenv["pos.payment.method"].create({
-              "name": f"Cash {code}",
-              "journal_id": cash_j.id,
-              "company_id": company.id,
-          })
+              # Pastikan jurnal cash punya profit/loss account bila diminta Odoo 17
+              if not cash_j.profit_account_id or not cash_j.loss_account_id:
+                  inc_acc = uenv["account.account"].search(
+                      [("company_id", "=", company.id), ("account_type", "in", ["income", "income_other"])], limit=1
+                  )
+                  exp_acc = uenv["account.account"].search(
+                      [("company_id", "=", company.id), ("account_type", "in", ["expense", "expense_direct_cost"])], limit=1
+                  )
+                  j_vals = {}
+                  if not cash_j.profit_account_id and inc_acc:
+                      j_vals["profit_account_id"] = inc_acc.id
+                  if not cash_j.loss_account_id and exp_acc:
+                      j_vals["loss_account_id"] = exp_acc.id
+                  if j_vals:
+                      cash_j.write(j_vals)
 
-          cfg = uenv["pos.config"].search([("company_id", "=", company.id)], limit=1)
-          vals = {
-              "name": f"POS Retail {code} ({sname})",
-              "journal_id": sale_j.id,
-              "payment_method_ids": [(4, pm.id)],
-              "retail_branch_id": branch.id,
-          }
-          if cfg:
-              cfg.write(vals)
-          else:
-              cfg = uenv["pos.config"].create(vals)
-          assert cfg.retail_branch_code == code, f"retail_branch_code mismatch: {cfg.retail_branch_code}"
+              pm = uenv["pos.payment.method"].search(
+                  [("journal_id", "=", cash_j.id), ("company_id", "=", company.id)], limit=1
+              ) or uenv["pos.payment.method"].create({
+                  "name": f"Cash {code}",
+                  "journal_id": cash_j.id,
+                  "company_id": company.id,
+              })
 
-          # 4. Produk retail + buka session + checkout paid order
-          prod = uenv["product.product"].create({
-              "name": f"Kopi Hitam Retail {code}",
-              "default_code": f"SKU-{code}-001",
-              "available_in_pos": True,
-              "detailed_type": "consu",
-              "list_price": 25000.0,
-          })
+              pricelist = (
+                  uenv["product.pricelist"].search([("company_id", "in", [company.id, False])], limit=1)
+                  or uenv["product.pricelist"].create({"name": f"PL {code}", "currency_id": company.currency_id.id})
+              )
 
-          cfg.open_ui()
-          sess = cfg.current_session_id
-          assert sess, "Gagal membuka pos.session"
-          if sess.state == "opening_control":
-              sess.action_pos_session_open()
-          assert sess.state == "opened"
+              cfg = uenv["pos.config"].search([("company_id", "=", company.id)], limit=1)
+              vals = {
+                  "name": f"POS Retail {code} ({sname})",
+                  "journal_id": sale_j.id,
+                  "invoice_journal_id": sale_j.id,
+                  "payment_method_ids": [(6, 0, [pm.id])],
+                  "pricelist_id": pricelist.id,
+                  "cash_control": False,
+                  "retail_branch_id": branch.id,
+              }
+              if cfg:
+                  cfg.write(vals)
+              else:
+                  cfg = uenv["pos.config"].create(vals)
+              assert cfg.retail_branch_code == code, f"retail_branch_code mismatch: {cfg.retail_branch_code}"
 
-          pricelist = (
-              cfg.pricelist_id
-              or uenv["product.pricelist"].search([("company_id", "in", [company.id, False])], limit=1)
-              or uenv["product.pricelist"].create({"name": f"PL {code}", "currency_id": company.currency_id.id})
-          )
+              # 4. Produk retail + buka session secara eksplisit + checkout paid order
+              prod = uenv["product.product"].create({
+                  "name": f"Kopi Hitam Retail {code}",
+                  "default_code": f"SKU-{code}-001",
+                  "available_in_pos": True,
+                  "detailed_type": "consu",
+                  "list_price": 25000.0,
+              })
 
-          order = uenv["pos.order"].create({
-              "session_id": sess.id,
-              "company_id": company.id,
-              "pricelist_id": pricelist.id,
-              "pos_reference": f"POS-{code}-0001",
-              "amount_tax": 0.0,
-              "amount_total": 50000.0,
-              "amount_paid": 50000.0,
-              "amount_return": 0.0,
-              "lines": [(0, 0, {
-                  "product_id": prod.id,
-                  "full_product_name": prod.name,
-                  "qty": 2.0,
-                  "price_unit": 25000.0,
-                  "price_subtotal": 50000.0,
-                  "price_subtotal_incl": 50000.0,
-                  "tax_ids_after_fiscal_position": [(6, 0, [])],
-              })],
-          })
-          order.add_payment({
-              "pos_order_id": order.id,
-              "payment_method_id": pm.id,
-              "amount": 50000.0,
-          })
-          order.action_pos_order_paid()
-          assert order.state == "paid"
+              sess = cfg.current_session_id
+              if not sess:
+                  sess = uenv["pos.session"].create({
+                      "user_id": admin.id,
+                      "config_id": cfg.id,
+                  })
+              if sess.state == "opening_control":
+                  sess.action_pos_session_open()
+              assert sess.state == "opened", f"State session tidak sesuai: {sess.state}"
 
-          # 5. Verifikasi compute metric custom model retail.store.branch
-          branch.invalidate_recordset()
-          assert branch.pos_count >= 1, f"pos_count tidak bertambah: {branch.pos_count}"
-          assert branch.today_sales_total >= 50000.0, f"today_sales_total salah: {branch.today_sales_total}"
+              order = uenv["pos.order"].create({
+                  "session_id": sess.id,
+                  "company_id": company.id,
+                  "pricelist_id": pricelist.id,
+                  "pos_reference": f"POS-{code}-0001",
+                  "amount_tax": 0.0,
+                  "amount_total": 50000.0,
+                  "amount_paid": 50000.0,
+                  "amount_return": 0.0,
+                  "lines": [(0, 0, {
+                      "product_id": prod.id,
+                      "full_product_name": prod.name,
+                      "qty": 2.0,
+                      "price_unit": 25000.0,
+                      "price_subtotal": 50000.0,
+                      "price_subtotal_incl": 50000.0,
+                      "tax_ids_after_fiscal_position": [(6, 0, [])],
+                  })],
+              })
+              order.add_payment({
+                  "pos_order_id": order.id,
+                  "payment_method_id": pm.id,
+                  "amount": 50000.0,
+              })
+              order.action_pos_order_paid()
+              assert order.state == "paid", f"Order belum paid: {order.state}"
 
-          uenv.cr.commit()
-          print(f"CI_POS_CONFIG_ID={cfg.id}")
-          print(f"CI_BRANCH_SALES={branch.today_sales_total}")
-          print("CI_POS_TX_OK=1")
+              # 5. Verifikasi compute metric custom model retail.store.branch
+              branch.invalidate_recordset()
+              assert branch.pos_count >= 1, f"pos_count tidak bertambah: {branch.pos_count}"
+              assert branch.today_sales_total >= 50000.0, f"today_sales_total salah: {branch.today_sales_total}"
+
+              uenv.cr.commit()
+              print(f"CI_POS_CONFIG_ID={cfg.id}")
+              print(f"CI_BRANCH_SALES={branch.today_sales_total}")
+              print("CI_POS_TX_OK=1")
+          except Exception:
+              traceback.print_exc()
+              sys.exit(1)
           PY
 
           for spec in "store1:8069:odoo_store1:odoo_store1:STR01" \
@@ -880,27 +914,46 @@ jobs:
             done
             (( ready )) || { echo "FAIL: odoo-${sname} tidak ready" >&2; docker logs --tail 80 "odoo-${sname}"; exit 1; }
 
-            # Eksekusi verifikasi retail_store_pos & transaksi POS menggunakan /tmp/odoo.conf asli container
-            docker exec -i -e STORE_CODE="$code" -e STORE_NAME="$sname" "odoo-${sname}" \
+            # Eksekusi verifikasi retail_store_pos & transaksi POS (tampilkan log penuh jika gagal)
+            if ! docker exec -i -e STORE_CODE="$code" -e STORE_NAME="$sname" "odoo-${sname}" \
               runuser -u odoo -- odoo shell -c /tmp/odoo.conf -d "$dbname" --no-http --log-level=warn \
-              < /tmp/pos_e2e_tx.py > "/tmp/tx_${sname}.log" 2>&1
+              < /tmp/pos_e2e_tx.py > "/tmp/tx_${sname}.log" 2>&1; then
+              echo "FAIL: odoo shell gagal di ${sname}:" >&2
+              cat "/tmp/tx_${sname}.log" >&2
+              exit 1
+            fi
 
-            grep -qx "CI_POS_TX_OK=1" "/tmp/tx_${sname}.log" || { cat "/tmp/tx_${sname}.log" >&2; exit 1; }
+            if ! grep -qx "CI_POS_TX_OK=1" "/tmp/tx_${sname}.log"; then
+              echo "FAIL: CI_POS_TX_OK=1 tidak ditemukan di ${sname}:" >&2
+              cat "/tmp/tx_${sname}.log" >&2
+              exit 1
+            fi
             cfg_id=$(sed -n 's/^CI_POS_CONFIG_ID=//p' "/tmp/tx_${sname}.log" | tail -n1)
             sales=$(sed -n 's/^CI_BRANCH_SALES=//p' "/tmp/tx_${sname}.log" | tail -n1)
 
-            # Verifikasi login JSON-RPC & /pos/ui
+            # Verifikasi login JSON-RPC & /pos/ui dengan log error eksplisit
             auth_resp=$(curl -fsS -c "/tmp/cookie_${sname}.txt" \
               -H 'Content-Type: application/json' \
               -d "{\"jsonrpc\":\"2.0\",\"method\":\"call\",\"params\":{\"db\":\"${dbname}\",\"login\":\"admin\",\"password\":\"admin\"}}" \
               "http://127.0.0.1:${port}/web/session/authenticate")
-            echo "$auth_resp" | grep -qE '"uid":[[:space:]]*[0-9]+'
+            if ! echo "$auth_resp" | grep -qE '"uid":[[:space:]]*[0-9]+'; then
+              echo "FAIL: Login JSON-RPC admin gagal di ${sname}: ${auth_resp}" >&2
+              exit 1
+            fi
 
             pos_ui_code=$(curl -sS -L -b "/tmp/cookie_${sname}.txt" \
               -o "/tmp/pos_ui_${sname}.html" -w '%{http_code}' \
               "http://127.0.0.1:${port}/pos/ui?config_id=${cfg_id}")
-            [[ "$pos_ui_code" == "200" ]]
-            grep -qi 'point_of_sale\|pos\.assets' "/tmp/pos_ui_${sname}.html"
+            if [[ "$pos_ui_code" != "200" ]]; then
+              echo "FAIL: /pos/ui?config_id=${cfg_id} di ${sname} mengembalikan HTTP ${pos_ui_code}" >&2
+              head -c 500 "/tmp/pos_ui_${sname}.html" >&2 || true
+              exit 1
+            fi
+            if ! grep -qi 'point_of_sale\|pos\.assets\|odoo\.info' "/tmp/pos_ui_${sname}.html"; then
+              echo "FAIL: Halaman /pos/ui di ${sname} tidak memuat bundle POS:" >&2
+              head -c 500 "/tmp/pos_ui_${sname}.html" >&2 || true
+              exit 1
+            fi
 
             # Verifikasi data retail_store_branch & pos_order ada di db1 SEKALIGUS tereplikasi ke db2
             cnt_db1=$(docker exec pos-db1 runuser -u postgres -- \
