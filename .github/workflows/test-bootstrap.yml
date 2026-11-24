@@ -1,20 +1,24 @@
-name: Test Day-0 Bootstrap Script
+name: Test Day-0 Bootstrap & Odoo Pola 1
 
 on:
   push:
     branches: [main, master]
     paths:
       - 'bootstrap-1st-install.sh'
+      - 'ansible-pg-dbaas-swarm-v3.zip'
       - '.github/workflows/test-bootstrap.yml'
   pull_request:
     paths:
       - 'bootstrap-1st-install.sh'
+      - 'ansible-pg-dbaas-swarm-v3.zip'
       - '.github/workflows/test-bootstrap.yml'
   workflow_dispatch:
 
 env:
-  # Sesuaikan jika nama/lokasi skrip di repo berbeda (mis. "./scripts/bootstrap-1st-install.sh")
+  # Sesuaikan jika nama/lokasi skrip di repo berbeda
   SCRIPT_PATH: ./bootstrap-1st-install.sh
+  ODOO_IMAGE: odoo:17
+  PG_IMAGE: postgres:16-alpine
 
 jobs:
   # ===========================================================================
@@ -36,21 +40,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          # --help harus sukses dan mencetak dokumentasi header
           "$SCRIPT_PATH" --help | grep -q "MODE 1: --managed"
           "$SCRIPT_PATH" -h | grep -q "MODE 2: --control"
 
-          # Tanpa argumen harus exit non-zero
           if "$SCRIPT_PATH" >/dev/null 2>&1; then
             echo "FAIL: tanpa argumen seharusnya gagal" >&2; exit 1
           fi
 
-          # Konflik --managed dan --control harus ditolak
           if "$SCRIPT_PATH" --managed --control >/dev/null 2>&1; then
             echo "FAIL: kombinasi --managed --control seharusnya ditolak" >&2; exit 1
           fi
 
-          # Opsi tak dikenal harus ditolak
           if "$SCRIPT_PATH" --managed --opsi-ngawur >/dev/null 2>&1; then
             echo "FAIL: opsi tak dikenal seharusnya ditolak" >&2; exit 1
           fi
@@ -67,14 +67,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install PyYAML for output validation
-        run: python3 -c "import yaml" 2>/dev/null || pip install --quiet pyyaml
+      - name: Setup isolated Python venv with PyYAML (PEP 668 safe)
+        run: |
+          python3 -m venv /tmp/unit-venv
+          /tmp/unit-venv/bin/pip install --quiet pyyaml
 
       - name: Run unit test suite against sourced functions
         shell: bash
         run: |
           set -Eeuo pipefail
-          # Source skrip tanpa menjalankan main() berkat BASH_SOURCE guard
+          PY=/tmp/unit-venv/bin/python
           # shellcheck disable=SC1090
           source "$SCRIPT_PATH"
           trap - ERR
@@ -98,22 +100,22 @@ jobs:
           }
 
           # --- A. Helper validators ---
-          assert_ok   "is_ipv4 valid"           is_ipv4 "10.88.0.1"
-          assert_fail "is_ipv4 octet > 255"     is_ipv4 "10.88.0.256"
-          assert_fail "is_ipv4 non-ip"          is_ipv4 "not.an.ip.addr"
-          assert_ok   "is_port valid"           is_port "5432"
-          assert_fail "is_port zero"            is_port "0"
-          assert_fail "is_port > 65535"         is_port "70000"
-          assert_ok   "is_name valid"           is_name "db_node-1"
-          assert_fail "is_name uppercase"       is_name "DB1"
-          assert_ok   "is_pg_ident valid"       is_pg_ident "odoo_store1"
-          assert_fail "is_pg_ident hyphen"      is_pg_ident "odoo-store1"
+          assert_ok   "is_ipv4 valid"             is_ipv4 "10.88.0.1"
+          assert_fail "is_ipv4 octet > 255"       is_ipv4 "10.88.0.256"
+          assert_fail "is_ipv4 non-ip"            is_ipv4 "not.an.ip.addr"
+          assert_ok   "is_port valid"             is_port "5432"
+          assert_fail "is_port zero"              is_port "0"
+          assert_fail "is_port > 65535"           is_port "70000"
+          assert_ok   "is_name valid"             is_name "db_node-1"
+          assert_fail "is_name uppercase"         is_name "DB1"
+          assert_ok   "is_pg_ident valid"         is_pg_ident "odoo_store1"
+          assert_fail "is_pg_ident hyphen"        is_pg_ident "odoo-store1"
           assert_ok   "is_placeholder_ip RFC5737" is_placeholder_ip "203.0.113.10"
           assert_fail "is_placeholder_ip RFC1918" is_placeholder_ip "172.28.0.10"
-          assert_ok   "is_hostname FQDN"        is_hostname "node-db1.internal.local"
-          assert_fail "is_hostname leading dash" is_hostname "-badhost"
-          assert_ok   "version_ge 2.16 >= 2.15" version_ge "2.16.4" "2.15"
-          assert_fail "version_ge 2.14 < 2.15"  version_ge "2.14.9" "2.15"
+          assert_ok   "is_hostname FQDN"          is_hostname "node-db1.internal.local"
+          assert_fail "is_hostname leading dash"  is_hostname "-badhost"
+          assert_ok   "version_ge 2.16 >= 2.15"   version_ge "2.16.4" "2.15"
+          assert_fail "version_ge 2.14 < 2.15"    version_ge "2.14.9" "2.15"
 
           # --- B. Validasi topologi & kuorum Raft ---
           export OVPN_PUBLIC_ENDPOINT="vpn.prod.example.internal"
@@ -126,7 +128,6 @@ jobs:
           assert_ok "validate_control_config valid"        validate_control_config
           assert_ok "check_placeholders clean RFC1918"     bash -c 'source "$SCRIPT_PATH"; trap - ERR; parse_cluster_specs; check_placeholders'
 
-          # Kuorum genap (backup + db1 = 2 manager) harus gagal tanpa ALLOW_BAD_QUORUM=1
           assert_fail "quorum even rejected" env \
             DB_HOSTS="1:db1:172.28.0.11:10.88.0.11:manager:100:yes,2:db2:172.28.0.12:10.88.0.12:worker:90:yes" \
             ALLOW_BAD_QUORUM=0 \
@@ -137,7 +138,6 @@ jobs:
             ALLOW_BAD_QUORUM=1 \
             bash -c 'source "$SCRIPT_PATH"; trap - ERR; parse_cluster_specs'
 
-          # Kasus error DB_HOSTS & STORE_LIST_SPEC
           assert_fail "DB_HOSTS < 2 node" env \
             DB_HOSTS="1:db1:172.28.0.11:10.88.0.11:manager:100:yes" \
             bash -c 'source "$SCRIPT_PATH"; trap - ERR; parse_cluster_specs'
@@ -154,7 +154,6 @@ jobs:
             STORE_LIST_SPEC="STR01:store1:monitoring:8069:odoo_store1,STR02:store2:monitoring:8069:odoo_store2" \
             bash -c 'source "$SCRIPT_PATH"; trap - ERR; parse_cluster_specs'
 
-          # STORE_LIST_SPEC="" menonaktifkan Pola 1 (0 store)
           STORE_COUNT=$(STORE_LIST_SPEC="" bash -c 'source "$SCRIPT_PATH"; trap - ERR; parse_cluster_specs; echo "${#STORE_NAMES[@]}"')
           [[ "$STORE_COUNT" == "0" ]] || { echo "FAIL: STORE_LIST_SPEC kosong seharusnya 0 store, dapat $STORE_COUNT" >&2; exit 1; }
           echo "PASS: STORE_LIST_SPEC='' disables Pola 1"
@@ -182,10 +181,9 @@ jobs:
           TMP_TEST=$(mktemp -d)
           trap 'rm -rf "$TMP_TEST"' EXIT
 
-          # Uji non-root SSH_USER memunculkan ansible_become: true
           SSH_USER="ubuntu" parse_cluster_specs
           SSH_USER="ubuntu" emit_inventory > "$TMP_TEST/hosts.yml"
-          python3 - "$TMP_TEST/hosts.yml" <<'PY'
+          "$PY" - "$TMP_TEST/hosts.yml" <<'PY'
           import sys, yaml
           data = yaml.safe_load(open(sys.argv[1]))
           assert data["all"]["vars"]["ansible_user"] == "ubuntu"
@@ -197,7 +195,6 @@ jobs:
           print("PASS: emit_inventory YAML valid & attributes exact")
           PY
 
-          # Uji patch_group_vars + komentar dipertahankan + idempotensi 2x run
           mkdir -p "$TMP_TEST/bak"
           cat > "$TMP_TEST/all.yml" <<'YAML'
           ---
@@ -216,7 +213,6 @@ jobs:
             patch_group_vars "$TMP_TEST/all.yml" "$TMP_TEST/bak"
           cp "$TMP_TEST/all.yml" "$TMP_TEST/all.run1.yml"
 
-          # Jalankan kedua kali untuk uji idempotensi
           OVPN_PUBLIC_ENDPOINT="vpn.prod.example.internal" OVPN_PORT="51820" OVPN_PROTO="tcp" \
             patch_group_vars "$TMP_TEST/all.yml" "$TMP_TEST/bak"
 
@@ -224,7 +220,7 @@ jobs:
           [[ -f "$TMP_TEST/bak/all.yml.orig" ]]
           grep -q "# Komentar penting sebelum variabel lain" "$TMP_TEST/all.yml"
 
-          python3 - "$TMP_TEST/all.yml" <<'PY'
+          "$PY" - "$TMP_TEST/all.yml" <<'PY'
           import sys, yaml
           data = yaml.safe_load(open(sys.argv[1]))
           assert data["ovpn_public_endpoint"] == "vpn.prod.example.internal"
@@ -238,7 +234,7 @@ jobs:
           PY
 
   # ===========================================================================
-  # 3. Dry-Run Smoke Test (Non-Root)
+  # 3. Dry-Run Smoke Test (Non-Root — Guardrail Read-Only)
   # ===========================================================================
   dry-run:
     name: 3. Dry-Run Mode (Managed & Control)
@@ -254,13 +250,11 @@ jobs:
 
           ssh-keygen -q -t ed25519 -N "" -f /tmp/dryrun_key
 
-          # Mode --managed --dry-run
           "$SCRIPT_PATH" --managed --dry-run \
             --hostname node-db1 \
             --pubkey-file /tmp/dryrun_key.pub 2>&1 | tee /tmp/managed-dry.log
-          grep -q "\[DRY-RUN\]" /tmp/managed-dry.log
+          grep -q "\[DRY-RUN\] systemctl enable --now ssh" /tmp/managed-dry.log
 
-          # Mode --control --dry-run --auto-deploy (dengan placeholder default -> warning, bukan error)
           "$SCRIPT_PATH" --control --dry-run --auto-deploy 2>&1 | tee /tmp/control-dry.log
           grep -q "ansible-playbook -i inventory/hosts.yml site.yml" /tmp/control-dry.log
 
@@ -293,35 +287,30 @@ jobs:
             -v "$PWD/$SCRIPT_PATH:/bootstrap.sh:ro" \
             -v "/tmp/ci_control_ed25519.pub:/control.pub:ro" \
             "${{ matrix.os }}" bash -Eeuo pipefail -s <<'EOF'
-          # Eksekusi pertama
           /bootstrap.sh --managed --hostname node-db1.test.local --pubkey-file /control.pub
 
-          # 1. Verifikasi paket prasyarat Ansible Managed Node
           for pkg in openssh-server openssh-client python3 python3-apt sudo acl curl ca-certificates gnupg; do
             dpkg -s "$pkg" >/dev/null 2>&1 || { echo "Package missing: $pkg" >&2; exit 1; }
           done
 
-          # 2. Verifikasi hostname & /etc/hosts
           [[ "$(hostname)" == "node-db1.test.local" ]]
           grep -qE '^127\.0\.1\.1[[:space:]]+node-db1\.test\.local node-db1$' /etc/hosts
 
-          # 3. Verifikasi authorized_keys & permission
           [[ "$(stat -c '%a' /root/.ssh)" == "700" ]]
           [[ "$(stat -c '%a' /root/.ssh/authorized_keys)" == "600" ]]
           [[ "$(wc -l < /root/.ssh/authorized_keys)" -eq 1 ]]
 
-          # 4. Verifikasi drop-in sshd & efektifitas sshd -T
           grep -qxF "PubkeyAuthentication yes" /etc/ssh/sshd_config.d/00-ansible-bootstrap.conf
           grep -qxF "PermitRootLogin prohibit-password" /etc/ssh/sshd_config.d/00-ansible-bootstrap.conf
           /usr/sbin/sshd -t
           /usr/sbin/sshd -T | grep -qi '^pubkeyauthentication yes$'
           /usr/sbin/sshd -T | grep -qi '^permitrootlogin prohibit-password$'
 
-          # 5. Uji idempotensi (eksekusi kedua tidak menduplikasi authorized_keys)
+          # Idempotensi
           /bootstrap.sh --managed --hostname node-db1.test.local --pubkey-file /control.pub
           [[ "$(wc -l < /root/.ssh/authorized_keys)" -eq 1 ]]
 
-          # 6. Uji penolakan pubkey cacat
+          # Pubkey cacat ditolak
           if /bootstrap.sh --managed --pubkey-string "ssh-ed25519 INVALID_KEY_PAYLOAD" >/dev/null 2>&1; then
             echo "FAIL: pubkey invalid seharusnya ditolak" >&2; exit 1
           fi
@@ -335,21 +324,17 @@ jobs:
           docker run --rm \
             -v "$PWD/$SCRIPT_PATH:/bootstrap.sh:ro" \
             "${{ matrix.os }}" bash -Eeuo pipefail -s <<'EOF'
-          # Pasang openssh-server duluan lalu hapus baris Include untuk mensimulasikan distro lama (Ubuntu 20.04)
           DEBIAN_FRONTEND=noninteractive apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends openssh-server
           sed -i '/Include \/etc\/ssh\/sshd_config\.d/d' /etc/ssh/sshd_config
 
-          # Jalankan --managed TANPA pubkey
           /bootstrap.sh --managed
 
-          # Pastikan PermitRootLogin TIDAK dipaksa prohibit-password (anti-lockout)
           grep -qxF "PubkeyAuthentication yes" /etc/ssh/sshd_config.d/00-ansible-bootstrap.conf
           if grep -q "PermitRootLogin" /etc/ssh/sshd_config.d/00-ansible-bootstrap.conf; then
             echo "FAIL: PermitRootLogin seharusnya tidak ditulis saat tanpa pubkey" >&2; exit 1
           fi
 
-          # Pastikan Include ditambahkan di baris pertama & backup dibuat
           head -n1 /etc/ssh/sshd_config | grep -q "Include /etc/ssh/sshd_config.d/\*.conf"
           [[ -f /etc/ssh/sshd_config.bak-bootstrap ]]
           /usr/sbin/sshd -t
@@ -361,7 +346,7 @@ jobs:
   # 5. End-to-End Multi-Container Test: Mode 2 (--control) + 5 Target Nodes
   # ===========================================================================
   e2e-control-cluster:
-    name: 5. E2E Cluster (--control -> 5 Nodes -> Ansible Ping & Auto-Deploy)
+    name: 5. E2E Control Cluster (5 Nodes + SSH + Vault)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [unit-tests, integration-managed]
@@ -373,8 +358,6 @@ jobs:
           set -euo pipefail
           chmod +x "$SCRIPT_PATH"
 
-          # 1. Buat arsip ZIP mock dengan struktur folder bersarang & permission 777
-          #    untuk menguji auto-unwrap folder + chmod go-w pada WORK_DIR
           mkdir -p /tmp/mock-zip/ansible-pg-dbaas-swarm-v3/inventory/group_vars
           cat > /tmp/mock-zip/ansible-pg-dbaas-swarm-v3/ansible.cfg <<'CFG'
           [defaults]
@@ -394,7 +377,7 @@ jobs:
               http_port: 8069
               db_name: "odoo_old"
 
-          # Marker untuk memastikan komentar tidak terhapus saat patch_group_vars
+          # Marker komentar tetap dipertahankan
           baseline_flag: "kept"
           YAML
 
@@ -433,7 +416,6 @@ jobs:
           chmod -R 777 /tmp/mock-zip/ansible-pg-dbaas-swarm-v3
           (cd /tmp/mock-zip && zip -rq /tmp/ansible-pg-dbaas-swarm-v3.zip ansible-pg-dbaas-swarm-v3)
 
-          # 2. Image target minimal (tanpa python3/python3-apt/acl/sudo -> uji REMOTE_PREP!)
           mkdir -p /tmp/target-img
           cat > /tmp/target-img/Dockerfile <<'DOCKER'
           FROM debian:12-slim
@@ -453,7 +435,6 @@ jobs:
           set -euo pipefail
           docker network create --subnet=172.28.0.0/24 dbaas-e2e-net
 
-          # Jalankan 5 target node (backup, db1, db2, db3, monitoring)
           declare -A NODES=(
             [backup]=172.28.0.10
             [db1]=172.28.0.11
@@ -468,12 +449,9 @@ jobs:
               dbaas-minimal-target
           done
 
-          # Uji jalur kombinasi: db1 di-bootstrap dulu via --managed (tanpa pubkey -> password tetap terbuka)
-          # sementara backup/db2/db3/monitoring dibiarkan kosongan (uji raw-SSH REMOTE_PREP)
           docker cp "$SCRIPT_PATH" e2e-db1:/bootstrap.sh
           docker exec e2e-db1 /bootstrap.sh --managed --hostname node-db1
 
-          # Jalankan Control Node bersih (Debian 12)
           docker run -d --name e2e-control --hostname control-node \
             --network dbaas-e2e-net --ip 172.28.0.5 \
             -v "$PWD/$SCRIPT_PATH:/opt/bootstrap-1st-install.sh:ro" \
@@ -494,28 +472,22 @@ jobs:
           export STORE_LIST_SPEC="STR01:store1:monitoring:8069:odoo_store1,STR02:store2:monitoring:8070:odoo_store2,STR03:store3:monitoring:8071:odoo_store3"
           export SSH_PASS="Day0TempPass!"
 
-          # --- RUN 1: Full Day-0 Bootstrap + Auto-Deploy ---
           /opt/bootstrap-1st-install.sh --control \
             --zip /opt/ansible-pg-dbaas-swarm-v3.zip \
             --work-dir /opt/ansible-pg-dbaas-swarm-v3 \
             --auto-deploy
 
-          # Verifikasi artefak Control Node
           test -x /usr/local/bin/ansible
           test -f /root/.ssh/id_ed25519
           test -f /root/.ssh/id_ed25519.pub
           test -f /opt/ansible-pg-dbaas-swarm-v3/inventory/hosts.yml
           test -f /opt/ansible-pg-dbaas-swarm-v3/.bootstrap-backup/all.yml.orig
-
-          # Pastikan direktori tidak world-writable (agar ansible.cfg dibaca)
           [[ -z "$(find /opt/ansible-pg-dbaas-swarm-v3 -perm -0002)" ]]
 
-          # Pastikan 3 koleksi Galaxy terpasang
           for col in community.docker community.general ansible.posix; do
             ansible-galaxy collection list | grep -q "$col"
           done
 
-          # --- RUN 2: Idempotensi + Encrypted vault.yml + --skip-ssh-bootstrap (tanpa SSH_PASS) ---
           unset SSH_PASS
           printf 'ci-vault-secret-pass\n' > /root/.vault_pass
           chmod 600 /root/.vault_pass
@@ -533,12 +505,11 @@ jobs:
             --skip-ssh-bootstrap \
             --auto-deploy
 
-          # Pastikan store_nodes tidak terduplikasi setelah 2x run
           [[ "$(grep -c '^store_nodes:' /opt/ansible-pg-dbaas-swarm-v3/inventory/group_vars/all.yml)" -eq 1 ]]
           echo "E2E Control + 5 Nodes + Vault PASSED!"
           EOF
 
-      - name: Verify REMOTE_PREP actually installed Python3 & ACL on barebones targets
+      - name: Verify REMOTE_PREP installed Python3 & ACL on barebones targets
         run: |
           set -euo pipefail
           for n in backup db2 db3 monitoring; do
@@ -551,3 +522,249 @@ jobs:
         run: |
           docker rm -f e2e-control e2e-backup e2e-db1 e2e-db2 e2e-db3 e2e-monitoring 2>/dev/null || true
           docker network rm dbaas-e2e-net 2>/dev/null || true
+
+  # ===========================================================================
+  # 6. End-to-End Runtime Test: Odoo Pola 1 (DB-per-Store) on Docker Swarm
+  # ===========================================================================
+  e2e-odoo-pola1:
+    name: 6. E2E Odoo Pola 1 (Swarm + PostgreSQL + 3 Stores + Isolation)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [unit-tests, dry-run]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ansible & community.docker in isolated venv
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/odoo-ansible-venv
+          /tmp/odoo-ansible-venv/bin/pip install --quiet --upgrade pip
+          /tmp/odoo-ansible-venv/bin/pip install --quiet "ansible-core>=2.15" docker pyyaml
+          /tmp/odoo-ansible-venv/bin/ansible-galaxy collection install community.docker
+
+      - name: Generate real inventory & group_vars/all.yml via bootstrap-1st-install.sh
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export WORK_DIR=/tmp/odoo-e2e-work
+          export OVPN_PUBLIC_ENDPOINT="vpn.odoo-e2e.internal"
+          export OVPN_PORT="1194"
+          export OVPN_PROTO="udp"
+          export BACKUP_SSH_IP="172.28.0.10" BACKUP_VPN_IP="10.88.0.1"
+          export MON_SSH_IP="172.28.0.20"    MON_VPN_IP="10.88.0.20"
+          export DB_HOSTS="1:db1:172.28.0.11:10.88.0.11:manager:100:yes,2:db2:172.28.0.12:10.88.0.12:manager:90:yes,3:db3:172.28.0.13:10.88.0.13:worker:0:no"
+          # Uji default db_user (STR01, STR03) & custom db_user (STR02 -> odoo_u2)
+          export STORE_LIST_SPEC="STR01:store1:monitoring:8069:odoo_store1,STR02:store2:monitoring:8070:odoo_store2:odoo_u2,STR03:store3:monitoring:8071:odoo_store3"
+
+          # Jika arsip proyek asli ada di repo, sekalian syntax-check site.yml aslinya
+          if [[ -f ./ansible-pg-dbaas-swarm-v3.zip ]]; then
+            echo "Arsip ansible-pg-dbaas-swarm-v3.zip ditemukan — mengekstrak & syntax-check site.yml..."
+            # shellcheck disable=SC1090
+            source "$SCRIPT_PATH"
+            parse_cluster_specs
+            validate_control_config
+            check_placeholders
+            unpack_ansible_project
+            generate_inventory_and_vars
+            (cd "$WORK_DIR" && /tmp/odoo-ansible-venv/bin/ansible-playbook -i inventory/hosts.yml site.yml --syntax-check)
+          else
+            # shellcheck disable=SC1090
+            source "$SCRIPT_PATH"
+            parse_cluster_specs
+            validate_control_config
+            check_placeholders
+            generate_inventory_and_vars
+          fi
+
+          cat "$WORK_DIR/inventory/group_vars/all.yml"
+
+      - name: Pre-pull PostgreSQL & Odoo images
+        run: |
+          docker pull -q "$PG_IMAGE"
+          docker pull -q "$ODOO_IMAGE"
+
+      - name: Deploy PostgreSQL + 3 Odoo Swarm Services driven by bootstrapped store_nodes
+        run: |
+          set -euo pipefail
+
+          cat > /tmp/odoo-e2e-work/deploy-odoo-pola1.yml <<'YAML'
+          ---
+          - name: E2E Deploy Sovereign PostgreSQL + Odoo Pola 1 (DB-per-Store)
+            hosts: localhost
+            connection: local
+            gather_facts: false
+            vars:
+              ansible_python_interpreter: /tmp/odoo-ansible-venv/bin/python
+              pg_image: "{{ lookup('env', 'PG_IMAGE') }}"
+              odoo_image: "{{ lookup('env', 'ODOO_IMAGE') }}"
+              pg_super_pass: "PgSuperSecretCI!"
+            tasks:
+              - name: Initialize single-node Docker Swarm
+                community.docker.docker_swarm:
+                  state: present
+                  advertise_addr: "127.0.0.1"
+
+              - name: Create attachable Swarm overlay network for DBaaS + Odoo
+                community.docker.docker_network:
+                  name: dbaas-odoo-net
+                  driver: overlay
+                  attachable: true
+
+              - name: Deploy PostgreSQL primary service on Swarm
+                community.docker.docker_swarm_service:
+                  name: pg-primary
+                  image: "{{ pg_image }}"
+                  networks:
+                    - dbaas-odoo-net
+                  env:
+                    POSTGRES_PASSWORD: "{{ pg_super_pass }}"
+                  replicas: 1
+
+              - name: Wait for PostgreSQL container to be running & ready
+                ansible.builtin.shell: |
+                  set -euo pipefail
+                  cid=$(docker ps -q --filter label=com.docker.swarm.service.name=pg-primary | head -n1)
+                  test -n "$cid"
+                  docker exec "$cid" pg_isready -U postgres
+                register: pg_ready
+                until: pg_ready.rc == 0
+                retries: 30
+                delay: 2
+                changed_when: false
+
+              - name: Provision isolated PostgreSQL role & database per store (Pola 1)
+                ansible.builtin.shell: |
+                  set -euo pipefail
+                  cid=$(docker ps -q --filter label=com.docker.swarm.service.name=pg-primary | head -n1)
+                  db_user="{{ item.db_user }}"
+                  db_name="{{ item.db_name }}"
+                  db_pass="OdooPass_{{ item.code }}!"
+
+                  docker exec -i "$cid" psql -v ON_ERROR_STOP=1 -U postgres <<SQL
+                  DO \$\$
+                  BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${db_user}') THEN
+                      EXECUTE format('CREATE ROLE %I LOGIN PASSWORD %L', '${db_user}', '${db_pass}');
+                    END IF;
+                  END \$\$;
+                  SQL
+
+                  exists=$(docker exec "$cid" psql -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${db_name}'")
+                  if [[ "$exists" != "1" ]]; then
+                    docker exec "$cid" psql -v ON_ERROR_STOP=1 -U postgres \
+                      -c "CREATE DATABASE \"${db_name}\" OWNER \"${db_user}\";"
+                  fi
+
+                  docker exec -i "$cid" psql -v ON_ERROR_STOP=1 -U postgres -d "${db_name}" <<SQL
+                  REVOKE ALL ON DATABASE "${db_name}" FROM PUBLIC;
+                  GRANT ALL ON DATABASE "${db_name}" TO "${db_user}";
+                  ALTER SCHEMA public OWNER TO "${db_user}";
+                  REVOKE ALL ON SCHEMA public FROM PUBLIC;
+                  GRANT ALL ON SCHEMA public TO "${db_user}";
+                  SQL
+                args:
+                  executable: /bin/bash
+                loop: "{{ store_nodes }}"
+                loop_control:
+                  label: "{{ item.code }}:{{ item.db_name }}({{ item.db_user }})"
+
+              - name: Deploy one isolated Odoo Swarm service per store in store_nodes
+                community.docker.docker_swarm_service:
+                  name: "odoo-{{ item.name }}"
+                  image: "{{ odoo_image }}"
+                  networks:
+                    - dbaas-odoo-net
+                  publish:
+                    - published_port: "{{ item.http_port | int }}"
+                      target_port: 8069
+                      protocol: tcp
+                      mode: host
+                  env:
+                    HOST: "pg-primary"
+                    PORT: "5432"
+                    USER: "{{ item.db_user }}"
+                    PASSWORD: "OdooPass_{{ item.code }}!"
+                  args:
+                    - "odoo"
+                    - "--database={{ item.db_name }}"
+                    - "--db-filter=^{{ item.db_name }}$"
+                    - "--init=base"
+                    - "--without-demo=all"
+                    - "--workers=0"
+                  replicas: 1
+                loop: "{{ store_nodes }}"
+                loop_control:
+                  label: "{{ item.name }}:{{ item.http_port }}"
+          YAML
+
+          /tmp/odoo-ansible-venv/bin/ansible-playbook \
+            -e @/tmp/odoo-e2e-work/inventory/group_vars/all.yml \
+            /tmp/odoo-e2e-work/deploy-odoo-pola1.yml
+
+      - name: Verify Odoo HTTP (/web/health & /web/login), Schema Init & Cross-Tenant DB Isolation
+        run: |
+          set -euo pipefail
+
+          # 1. Tunggu semua 3 store selesai init base & merespons HTTP 200 di /web/health dan /web/login
+          for spec in "store1:8069:odoo_store1:odoo_store1:STR01" \
+                      "store2:8070:odoo_store2:odoo_u2:STR02" \
+                      "store3:8071:odoo_store3:odoo_store3:STR03"; do
+            IFS=':' read -r sname port dbname dbuser code <<< "$spec"
+            echo "=== Menunggu Odoo ${sname} di http://127.0.0.1:${port} (db=${dbname}) ==="
+
+            ready=0
+            for i in $(seq 1 90); do
+              health=$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/web/health" 2>/dev/null || true)
+              code_login=$(curl -sS -L -o /tmp/login_${sname}.html -w '%{http_code}' --max-time 10 "http://127.0.0.1:${port}/web/login" 2>/dev/null || true)
+              if echo "$health" | grep -q '"pass"' && [[ "$code_login" == "200" ]] && grep -qi 'odoo\|login' "/tmp/login_${sname}.html"; then
+                echo "PASS: ${sname} (:${port}) -> /web/health=${health} & /web/login=HTTP 200"
+                ready=1
+                break
+              fi
+              sleep 3
+            done
+
+            if (( ! ready )); then
+              echo "FAIL: Odoo ${sname} (:${port}) tidak siap dalam batas waktu." >&2
+              docker service logs --tail 80 "odoo-${sname}" || true
+              exit 1
+            fi
+          done
+
+          # 2. Verifikasi tabel Odoo inti terbentuk di tiap database store
+          PG_CID=$(docker ps -q --filter label=com.docker.swarm.service.name=pg-primary | head -n1)
+          for spec in "odoo_store1:odoo_store1:STR01" \
+                      "odoo_store2:odoo_u2:STR02" \
+                      "odoo_store3:odoo_store3:STR03"; do
+            IFS=':' read -r dbname dbuser code <<< "$spec"
+            mod_count=$(docker exec -e "PGPASSWORD=OdooPass_${code}!" "$PG_CID" \
+              psql -U "$dbuser" -d "$dbname" -tAc "SELECT count(*) FROM ir_module_module WHERE state='installed';")
+            user_count=$(docker exec -e "PGPASSWORD=OdooPass_${code}!" "$PG_CID" \
+              psql -U "$dbuser" -d "$dbname" -tAc "SELECT count(*) FROM res_users;")
+            echo "PASS: DB ${dbname} (owner=${dbuser}) -> installed_modules=${mod_count}, res_users=${user_count}"
+            (( mod_count > 0 && user_count > 0 ))
+          done
+
+          # 3. Uji isolasi Pola 1: user store1 TIDAK BOLEH bisa konek ke database store2
+          if docker exec -e "PGPASSWORD=OdooPass_STR01!" "$PG_CID" \
+               psql -U odoo_store1 -d odoo_store2 -c "SELECT 1;" >/dev/null 2>&1; then
+            echo "FAIL: Pelanggaran isolasi Pola 1! odoo_store1 bisa mengakses odoo_store2!" >&2
+            exit 1
+          fi
+          echo "PASS: Isolasi Pola 1 terverifikasi (odoo_store1 ditolak masuk ke odoo_store2)"
+
+      - name: Dump service logs on failure
+        if: failure()
+        run: |
+          docker service ls || true
+          for s in pg-primary odoo-store1 odoo-store2 odoo-store3; do
+            echo "===== LOGS: $s ====="
+            docker service logs --tail 60 "$s" 2>&1 || true
+          done
+
+      - name: Cleanup Swarm services & leave Swarm
+        if: always()
+        run: |
+          docker service rm odoo-store1 odoo-store2 odoo-store3 pg-primary 2>/dev/null || true
+          docker network rm dbaas-odoo-net 2>/dev/null || true
+          docker swarm leave --force 2>/dev/null || true
