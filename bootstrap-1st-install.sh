@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  bootstrap-1st-install.sh — Day-0 First-Install Bootstrap untuk
-#  Sovereign PostgreSQL DBaaS v3 (Ansible + Docker Swarm + OpenVPN + Pola 1)
+#  Sovereign PostgreSQL DBaaS v3 (Ansible + Docker Swarm + OpenVPN +
+#  Pola 1 Odoo Retail Store POS)
 # =============================================================================
 #  Menjembatani kondisi VM/server baru ("kosongan") hingga siap menjalankan
 #  `ansible-playbook site.yml` secara penuh tanpa konfigurasi manual berulang:
@@ -23,14 +24,17 @@
 #        (venv /opt/ansible-venv bila versi sistem tidak ada/terlalu lama)
 #      - Pasang Ansible Galaxy collections (community.docker, general, posix)
 #      - Generate SSH ed25519 keypair (~/.ssh/id_ed25519) bila belum ada
-#      - Validasi input (IP, port, nama, duplikat) & kuorum Swarm Manager
-#        (wajib ganjil >= 3: mis. backup, db1, db2; override: ALLOW_BAD_QUORUM=1)
+#      - Validasi input (IP, port, nama, duplikat, modul Odoo POS) & kuorum
+#        Swarm Manager (wajib ganjil >= 3: mis. backup, db1, db2; override:
+#        ALLOW_BAD_QUORUM=1)
 #      - Tolak nilai placeholder/contoh (TEST-NET, vpn.domain-lo.com) kecuali
 #        ALLOW_PLACEHOLDER=1
 #      - Otomatis ekstrak `ansible-pg-dbaas-swarm-v3.zip` ke WORK_DIR
 #      - Auto-generate `inventory/hosts.yml` & patch `ovpn_public_endpoint`,
-#        `ovpn_port`, `ovpn_proto`, serta `store_nodes` pada
-#        `inventory/group_vars/all.yml` (idempoten, backup di .bootstrap-backup/)
+#        `ovpn_port`, `ovpn_proto`, konfigurasi Odoo Retail Store POS
+#        (`odoo_image`, `odoo_pos_modules`, `odoo_init_pos`, `odoo_without_demo`)
+#        serta `store_nodes` pada `inventory/group_vars/all.yml`
+#        (idempoten, backup di .bootstrap-backup/)
 #      - Distribusikan SSH key ke seluruh host (`ssh-copy-id` / `sshpass`) +
 #        raw-SSH bootstrap `python3`, `python3-apt`, `acl`, `sudo` bila kosongan
 #      - Jalankan preflight `ansible all -m ping`
@@ -43,6 +47,8 @@
 #    --pubkey-string "<key>"      (managed) public key sebagai string
 #    --zip <file.zip>             (control) arsip proyek Ansible
 #    --work-dir <dir>             (control) tujuan ekstrak proyek
+#    --odoo-image <image:tag>     (control) image Docker Odoo (default: odoo:17)
+#    --odoo-modules <mod1,mod2>   (control) modul Odoo Retail POS (default: point_of_sale)
 #    --auto-deploy                (control) lanjut `ansible-playbook site.yml`
 #    --skip-ssh-bootstrap         (control) lewati distribusi SSH key (ping tetap jalan)
 #    --dry-run                    Tampilkan rencana tanpa mengubah sistem
@@ -52,12 +58,14 @@
 #    # A. Di setiap VM baru (opsional jika root SSH password sudah aktif, cukup langsung ke B):
 #    sudo ./bootstrap-1st-install.sh --managed --hostname node-db1 --pubkey-file ./control.pub
 #
-#    # B. Di Control Node (1 perintah siapkan semua + auto-deploy!):
+#    # B. Di Control Node (1 perintah siapkan semua + auto-deploy Odoo Retail POS!):
 #    export OVPN_PUBLIC_ENDPOINT="vpn.domain-lo.com"
 #    export BACKUP_SSH_IP="203.0.113.10"  BACKUP_VPN_IP="10.88.0.1"
 #    export MON_SSH_IP="198.51.100.20"    MON_VPN_IP="10.88.0.20"
 #    export DB_HOSTS="1:db1:198.51.100.11:10.88.0.11:manager:100:yes,2:db2:198.51.100.12:10.88.0.12:manager:90:yes,3:db3:198.51.100.13:10.88.0.13:worker:0:no"
 #    export STORE_LIST_SPEC="STR01:store1:monitoring:8069:odoo_store1,STR02:store2:monitoring:8070:odoo_store2,STR03:store3:monitoring:8071:odoo_store3"
+#    export ODOO_IMAGE="odoo:17"
+#    export ODOO_POS_MODULES="point_of_sale,stock,account"
 #    # Opsional untuk distribusi SSH key tanpa prompt interaktif:
 #    # export SSH_PASS="PasswordRootSementara"
 #    # Catatan: node DB pertama di DB_HOSTS dijadikan primary (is_primary: true).
@@ -89,6 +97,12 @@ DB_HOSTS="${DB_HOSTS:-1:db1:198.51.100.11:10.88.0.11:manager:100:yes,2:db2:198.5
 # Format STORE_LIST_SPEC (Pola 1 DB-per-Store): "code:name:swarm_host:http_port:db_name[:db_user]"
 # Catatan: tanpa titik-dua (:-) agar STORE_LIST_SPEC="" bisa dipakai untuk MENONAKTIFKAN Pola 1.
 STORE_LIST_SPEC="${STORE_LIST_SPEC-STR01:store1:monitoring:8069:odoo_store1,STR02:store2:monitoring:8070:odoo_store2,STR03:store3:monitoring:8071:odoo_store3}"
+
+# Konfigurasi Odoo Retail Store POS (Pola 1 DB-per-Store)
+ODOO_IMAGE="${ODOO_IMAGE:-odoo:17}"
+ODOO_POS_MODULES="${ODOO_POS_MODULES:-point_of_sale}"
+ODOO_INIT_POS="${ODOO_INIT_POS:-true}"
+ODOO_WITHOUT_DEMO="${ODOO_WITHOUT_DEMO:-all}"
 
 # Koneksi SSH Day-0
 SSH_USER="${SSH_USER:-root}"
@@ -195,6 +209,8 @@ is_hostname() {
   (( ${#1} <= 253 )) || return 1
   [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]]
 }
+is_docker_image()   { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,254}$ ]]; }
+is_odoo_modules()   { [[ $1 =~ ^[a-z][a-z0-9_]*(,[a-z][a-z0-9_]*)*$ ]]; }
 
 version_ge() {  # true bila $1 >= $2 (urutan versi)
   [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | sed -n '1p')" == "$2" ]]
@@ -370,6 +386,12 @@ validate_control_config() {
   is_ipv4 "$MON_SSH_IP"                  || die "MON_SSH_IP '${MON_SSH_IP}' bukan IPv4 valid."
   is_ipv4 "$MON_VPN_IP"                  || die "MON_VPN_IP '${MON_VPN_IP}' bukan IPv4 valid."
   [[ "$BACKUP_VPN_IP" != "$MON_VPN_IP" ]] || die "BACKUP_VPN_IP dan MON_VPN_IP tidak boleh sama (${BACKUP_VPN_IP})."
+  is_docker_image "$ODOO_IMAGE"          || die "ODOO_IMAGE '${ODOO_IMAGE}' tidak valid."
+  is_odoo_modules "$ODOO_POS_MODULES"    || die "ODOO_POS_MODULES '${ODOO_POS_MODULES}' tidak valid (contoh: point_of_sale atau point_of_sale,stock)."
+  [[ $ODOO_INIT_POS == "true" || $ODOO_INIT_POS == "false" ]] \
+                                         || die "ODOO_INIT_POS harus true|false (saat ini: '${ODOO_INIT_POS}')."
+  [[ $ODOO_WITHOUT_DEMO == "all" || $ODOO_WITHOUT_DEMO == "false" ]] \
+                                         || die "ODOO_WITHOUT_DEMO harus all|false (saat ini: '${ODOO_WITHOUT_DEMO}')."
   return 0
 }
 
@@ -745,7 +767,7 @@ EOF
 
 emit_store_block() {
   local s
-  echo "# BEGIN bootstrap-managed store_nodes (Pola 1 DB-per-Store) — auto-generated by bootstrap-1st-install.sh"
+  echo "# BEGIN bootstrap-managed store_nodes (Pola 1 DB-per-Store Odoo Retail POS) — auto-generated by bootstrap-1st-install.sh"
   echo "store_nodes:"
   for s in "${STORE_NAMES[@]}"; do
     cat <<EOF
@@ -755,6 +777,8 @@ emit_store_block() {
     http_port: ${ST_PORT[$s]}
     db_name: "${ST_DB[$s]}"
     db_user: "${ST_USER[$s]}"
+    pos_enabled: true
+    pos_modules: "${ODOO_POS_MODULES}"
 EOF
   done
   echo "# END bootstrap-managed store_nodes"
@@ -781,6 +805,10 @@ patch_group_vars() {
   yaml_set_scalar "$vars_file" ovpn_public_endpoint "\"${OVPN_PUBLIC_ENDPOINT}\""
   yaml_set_scalar "$vars_file" ovpn_port "${OVPN_PORT}"
   yaml_set_scalar "$vars_file" ovpn_proto "\"${OVPN_PROTO}\""
+  yaml_set_scalar "$vars_file" odoo_image "\"${ODOO_IMAGE}\""
+  yaml_set_scalar "$vars_file" odoo_pos_modules "\"${ODOO_POS_MODULES}\""
+  yaml_set_scalar "$vars_file" odoo_init_pos "${ODOO_INIT_POS}"
+  yaml_set_scalar "$vars_file" odoo_without_demo "\"${ODOO_WITHOUT_DEMO}\""
 
   if (( ${#STORE_NAMES[@]} > 0 )); then
     tmp_all=$(mktemp); CLEANUP_PATHS+=("$tmp_all")
@@ -801,7 +829,7 @@ patch_group_vars() {
     sed -i -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}' "$tmp_all"
     { echo ""; emit_store_block; } >> "$tmp_all"
     cat "$tmp_all" > "$vars_file"   # cat (bukan mv) agar mode/owner file asli terjaga
-    ok "Daftar Pola 1 (${#STORE_NAMES[@]} stores) ditulis langsung ke ${vars_file}"
+    ok "Daftar Pola 1 Odoo Retail POS (${#STORE_NAMES[@]} stores, modul=${ODOO_POS_MODULES}) ditulis ke ${vars_file}"
   fi
 }
 
@@ -813,7 +841,7 @@ generate_inventory_and_vars() {
 
   if (( DRY_RUN )); then
     log "[DRY-RUN] Generate ${inv_file} (backup=${BACKUP_SSH_IP}, dbs=${DB_NAMES[*]}, mon=${MON_SSH_IP})"
-    log "[DRY-RUN] Update ovpn_public_endpoint=${OVPN_PUBLIC_ENDPOINT}, ovpn_port, ovpn_proto & ${#STORE_NAMES[@]} store_nodes di ${vars_file}"
+    log "[DRY-RUN] Update ovpn_public_endpoint=${OVPN_PUBLIC_ENDPOINT}, odoo_image=${ODOO_IMAGE}, odoo_pos_modules=${ODOO_POS_MODULES} & ${#STORE_NAMES[@]} store_nodes di ${vars_file}"
     return 0
   fi
 
@@ -924,7 +952,7 @@ run_deploy() {
   fi
 
   ( cd "$WORK_DIR" && ansible-playbook "${args[@]}" )
-  ok "Deployment penuh DBaaS v3 selesai!"
+  ok "Deployment penuh DBaaS v3 + Odoo Retail Store POS selesai!"
 }
 
 run_control_bootstrap() {
@@ -948,7 +976,7 @@ run_control_bootstrap() {
   else
     echo "" >&2
     ok "1st Install Bootstrap Control Node SELESAI!"
-    log "Langkah terakhir untuk deploy seluruh cluster (OpenVPN + Swarm + Secrets + Pola 1 Odoo):"
+    log "Langkah terakhir untuk deploy seluruh cluster (OpenVPN + Swarm + PostgreSQL + Pola 1 Odoo Retail POS):"
     log "  cd ${WORK_DIR}"
     log "  ansible-playbook -i inventory/hosts.yml site.yml"
     log "  # (Atau tambah Vault dulu: ansible-vault create inventory/group_vars/vault.yml && ansible-playbook -i inventory/hosts.yml site.yml --ask-vault-pass)"
@@ -971,6 +999,8 @@ main() {
       --pubkey-string)       PUBKEY_STRING="${2:?--pubkey-string butuh nilai}"; shift ;;
       --zip)                 ANSIBLE_ZIP="${2:?--zip butuh path file zip}"; shift ;;
       --work-dir)            WORK_DIR="${2:?--work-dir butuh path}"; shift ;;
+      --odoo-image)          ODOO_IMAGE="${2:?--odoo-image butuh nilai}"; shift ;;
+      --odoo-modules)        ODOO_POS_MODULES="${2:?--odoo-modules butuh nilai}"; shift ;;
       --auto-deploy)         AUTO_DEPLOY=1 ;;
       --skip-ssh-bootstrap)  SKIP_SSH_BOOTSTRAP=1 ;;
       --dry-run)             DRY_RUN=1 ;;
