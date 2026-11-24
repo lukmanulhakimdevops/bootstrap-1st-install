@@ -426,6 +426,10 @@ configure_hostname() {
 }
 
 enable_ssh_service() {
+  if (( DRY_RUN )); then
+    log "[DRY-RUN] systemctl enable --now ssh (atau sshd)"
+    return 0
+  fi
   if ! command -v systemctl >/dev/null 2>&1 || [[ ! -d /run/systemd/system ]]; then
     warn "systemd tidak aktif (container?) — lewati 'systemctl enable --now ssh'."
     return 0
